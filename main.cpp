@@ -4,34 +4,63 @@
 #include <random>
 #include <chrono>
 #include <fstream>
+#include <filesystem>
+#include <unordered_map>
 
 using namespace std;
+namespace fs = std::filesystem;
 
 vector<char> symbolData;
 
 int numFiles = 0;
 
-int currentSymbolIndex = 0;
-int currentDateIndex = 0;
-int numSymbols = 0;
 
-int d[11160]; // 30Y * 12M * 31D
+// date to index and back mapping
 int numDates = 0;
-vector<int> D;
-vector<vector<char>> t;
+unordered_map<int, int> date_index;
+unordered_map<int, int> index_date;
+
+// symbol to index and back mapping
+int numSymbols = 0;
+unordered_map<string, int> symbol_index;
+unordered_map<int, string> index_symbol;
+
+// data used to read CSV files
+vector<string> filesToRead;
+string fileAddress = "";
+string fileLine = "";
+int fileLineIndex = 0;
+int fileLineLength = 0;
+int fileLineSpot = 0;
+int fileLineSpot1 = 0;
+
 
 // prices and date indices that have not been filled (inside p[] and d[])
 #define DUMMY_INT INT_MIN
 // empty entries[] and exits[] values (unnecessary)
 #define DUMMY_DOUBLE (double)INT_MIN
 
-#define maxNumSymbols 6000
+#define maxNumSymbols 25000
 #define maxNumDates 1000
 #define numStoredTimes 3
 // times whose bars should be stored and used to backtest
-vector<int> selectedTimes = { 900, 905, 1500 };
+vector<int> storedTimes = { 900, 905, 1500 };
 // metrics (OHLCV) of the bars that should be stored and used to backtest
-vector<int> selectedMetrics = { 'o', 'c', 'c' };
+vector<int> storedMetrics = { 'O', 'C', 'C' };
+
+string columnCodes = "";
+
+
+// file parsing info
+int currentSymbolIndex = 0;
+string currentSymbol = "";
+long long currentDateTime = 0;
+int currentDate = 0;
+int currentDateIndex = 0;
+int currentTime = 0;
+int currentTimeIndex = 0;
+vector<int> currentOHLCV = {0,0,0,0,0};
+
 
 // data points
 int p[maxNumSymbols * maxNumDates * numStoredTimes];
@@ -40,26 +69,27 @@ int p[maxNumSymbols * maxNumDates * numStoredTimes];
 int numPointsByDateIndex[maxNumDates];
 
 // values for each day and symbol used to determine trade entry and exit values
-int tradeSymbolIndices[maxNumDates][maxNumSymbols];
-double entries[maxNumDates][maxNumSymbols];
-double exits[maxNumDates][maxNumSymbols];
+unordered_map<string, int> symbol_index_day[maxNumDates];
+unordered_map<int, string> index_symbol_day[maxNumDates];
+double** entries;
+double** exits;
 
 // values that sweep across all dates, filling in holes in price with last price value recorded for that symbol
-//int priceSweeper[maxNumSymbols];
+int priceSweeper[maxNumSymbols];
 
 // cumulative volume for each symbol and date
 long long totalVolume[maxNumSymbols][maxNumDates];
 
 
 // predefined user-created symbol information for user symbol organization and volume/market cap filtering during backtesting
-vector<char> userTickers[maxNumSymbols];
+string userTickers[maxNumSymbols];
 long long userVolumes[maxNumSymbols];
 long long userMarketCaps[maxNumSymbols];
 
 // symbols allowed to trade. filter by volume and market cap using data from the above arrays.
 int numAllowedTickers = 0;
-vector<char> allowedTickers[maxNumSymbols];
-int allowedToUserIndex[maxNumSymbols];
+unordered_map<string, int> allowed_index;
+unordered_map<int, string> index_allowed;
 
 
 long long power(int b, int e) {
@@ -76,249 +106,751 @@ bool isNumeric(char c) {
     return (c >= '0' && c <= '9');
 }
 
-vector<char> dateToString(int d) {
-    vector<char> s = { '2','0' };
-    s.push_back((char)(d / (10 * 12 * 31)) + '0');
-    d %= 10 * 12 * 31;
-    s.push_back((char)(d / (12 * 31)) + '0');
-    d %= 12 * 31;
-    s.push_back((char)(d / (10 * 31)) + '0');
-    d %= 10 * 31;
-    s.push_back((char)(d / (31)) + '0');
-    d %= 10;
-    s.push_back((char)(d / (10)) + '0');
-    s.push_back((char)(d) + '0');
-    return s;
+string dateToString(int d) {
+    if(d < 20000000 || d > 20291231){
+        cerr << "Date " << d << " is out of the range 20000000 to 20291231.\n\n";
+        exit(1);
+    }
+    return to_string(d);
 }
 
-bool read(string address, int numDummyValuesAfterTime){
-    ifstream f(address);
+// parse a ticker symbol within a CSV file line
+string parseSymbol(){
+    string ticker = "";
+    fileLineSpot1 = fileLineSpot;
+    while (fileLine[fileLineSpot1] != ',') {
+        fileLineSpot1++;
+        if(fileLineSpot1 >= fileLineLength){
+            break;
+        }
+    }
+    if(fileLineSpot1 - fileLineSpot < 1 || fileLineSpot1 - fileLineSpot > 10){
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a ticker symbol of length " << fileLineSpot1 - fileLineSpot << ", but the length must be from 1 through 10.\n\n";
+        exit(1);
+    }
+    return fileLine.substr(fileLineSpot, fileLineSpot1 - fileLineSpot);
+}
 
-    if (!f.is_open()) {
-        return 0;
+// parse a time within a CSV file line
+int parseTime(){
+    
+    if(fileLineSpot + 4 >= fileLineLength){
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " ended before full 5-character time value was read.\n\n";
+        exit(1);
     }
 
-    string s = "";
+    if (!(isNumeric(fileLine[fileLineSpot]) && isNumeric(fileLine[fileLineSpot + 1]) && isNumeric(fileLine[fileLineSpot + 3]) && isNumeric(fileLine[fileLineSpot + 4]) && fileLine[fileLineSpot + 2] == ':')) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " does not have the correct time format (HH:MM) for the moment value.\n\n";
+        exit(1);
+    }
 
-    getline(f, s);
+    // time
+    int time = (fileLine[fileLineSpot] - '0') * 1000 + (fileLine[fileLineSpot + 1] - '0') * 100 + (fileLine[fileLineSpot + 2] - '0') * 10 + (fileLine[fileLineSpot + 3] - '0');
+    if (time < 0) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a time before 00:00.\n\n";
+        exit(1);
+    }
+    if (time >= 2400) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a time after 23:59.\n\n";
+        exit(1);
+    }
+    
+    return time;
+}
 
-    int currentFileBar = -1;
-    while (getline(f, s)) {
-        currentFileBar++;
-        int n = s.length();
+// parse a date within a CSV file line
+int parseDate(){
+    
+    if(fileLineSpot + 9 >= fileLineLength){
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " ended before full 10-character date value was read.\n\n";
+        exit(1);
+    }
 
-        if (n < 20) {
-            cerr << "Bar " << currentFileBar << " in file " << address << " with a length of " << n << "characters was incorrectly shorter than 20 characters long. Make sure it includes a date and time, OHLCV values, and a ticker symbol.\n\n";
+    if (!(isNumeric(fileLine[fileLineSpot]) && isNumeric(fileLine[fileLineSpot + 1]) && isNumeric(fileLine[fileLineSpot + 2]) && isNumeric(fileLine[fileLineSpot + 3]) && isNumeric(fileLine[fileLineSpot + 5]) && isNumeric(fileLine[fileLineSpot + 6]) && isNumeric(fileLine[fileLineSpot + 8]) && isNumeric(fileLine[fileLineSpot + 9]) && fileLine[fileLineSpot + 4] == '-' && fileLine[fileLineSpot + 7] == '-')) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " does not have the correct date format (YYYY-MM-DD) for the moment value.\n\n";
+        exit(1);
+    }
+
+    // date
+    int date = (fileLine[fileLineSpot + 2] - '0') * 100000 + (fileLine[fileLineSpot + 3] - '0') * 10000 + (fileLine[fileLineSpot + 5] - '0') * 1000 + (fileLine[fileLineSpot + 6] - '0') * 100 + (fileLine[fileLineSpot + 8] - '0') * 10 + (fileLine[fileLineSpot + 9] - '0');
+    if (date < 0) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a date before 2000/01/01.\n\n";
+        exit(1);
+    }
+    if (date >= 11160) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a date after 2030/01/01.\n\n";
+        exit(1);
+    }
+    
+    return date;
+}
+
+// parse a combined date and time within a CSV file line
+long long parseMoment(){
+    
+    if(fileLineSpot + 15 >= fileLineLength){
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " ended before full 16-character moment value was read.\n\n";
+        exit(1);
+    }
+
+    if (!(isNumeric(fileLine[fileLineSpot]) && isNumeric(fileLine[fileLineSpot + 1]) && isNumeric(fileLine[fileLineSpot + 2]) && isNumeric(fileLine[fileLineSpot + 3]) && isNumeric(fileLine[fileLineSpot + 5]) && isNumeric(fileLine[fileLineSpot + 6]) && isNumeric(fileLine[fileLineSpot + 8]) && isNumeric(fileLine[fileLineSpot + 9]) && isNumeric(fileLine[fileLineSpot + 11]) && isNumeric(fileLine[fileLineSpot + 12]) && isNumeric(fileLine[fileLineSpot + 14]) && isNumeric(fileLine[fileLineSpot + 15]) && fileLine[fileLineSpot + 4] == '-' && fileLine[fileLineSpot + 7] == '-')) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " does not have the correct date and time format (YYYY-MM-DD HH:MM:SS or YYYY-MM-DD HH:MM) for the moment value.\n\n";
+        exit(1);
+    }
+    
+
+    // date
+    int date = (fileLine[fileLineSpot + 2] - '0') * 100000 + (fileLine[fileLineSpot + 3] - '0') * 10000 + (fileLine[fileLineSpot + 5] - '0') * 1000 + (fileLine[fileLineSpot + 6] - '0') * 100 + (fileLine[fileLineSpot + 8] - '0') * 10 + (fileLine[fileLineSpot + 9] - '0');
+    if (date < 0) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a date before 2000/01/01.\n\n";
+        exit(1);
+    }
+    if (date >= 11160) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a date after 2030/01/01.\n\n";
+        exit(1);
+    }
+
+
+    // time
+    int time = (fileLine[fileLineSpot + 11] - '0') * 1000 + (fileLine[fileLineSpot + 12] - '0') * 100 + (fileLine[fileLineSpot + 14] - '0') * 10 + (fileLine[fileLineSpot + 15] - '0');
+    if (time < 0) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a time before 00:00.\n\n";
+        exit(1);
+    }
+    if (time >= 2400) {
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " has a time after 23:59.\n\n";
+        exit(1);
+    }
+
+    return date * 10000 + time;
+}
+
+// parse a Unix timestamp within a CSV file line
+long long parseUnix(){
+
+    while(fileLine[fileLineSpot1] != ','){
+        if (!(isNumeric(fileLine[fileLineSpot1]))) {
+            cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " does not have the correct Unix time format. It must contain only digits.\n\n";
             exit(1);
         }
 
-        if (!(isNumeric(s[0]) && isNumeric(s[1]) && isNumeric(s[2]) && isNumeric(s[3]) && isNumeric(s[5]) && isNumeric(s[6]) && isNumeric(s[8]) && isNumeric(s[9]) && isNumeric(s[11]) && isNumeric(s[12]) && isNumeric(s[14]) && isNumeric(s[15]) && s[4] == '-' && s[7] == '-')) {
-            cerr << "Bar " << currentFileBar << " in file " << address << " does not have the correct date and time format (YYYY-MM-DD HH:MM:SS).\n\n";
-            exit(1);
+        fileLineSpot1++;
+        if (fileLineSpot1 >= fileLineLength) {
+            break;
         }
+    }
 
-        // determine if time is one of the selected times
-        int time = (s[11] - '0') * 1000 + (s[12] - '0') * 100 + (s[14] - '0') * 10 + (s[15] - '0');
-        int selectedTimeIndex = -1;
-        for (int i = 0; i < numStoredTimes; i++) {
-            if (time == selectedTimes[i]) {
-                selectedTimeIndex = i;
-                break;
-            }
-        }
-        // if not, move on to the next bar
-        if (selectedTimeIndex == -1) {
-            continue;
-        }
+    long long unix = 0;
 
-        // date
-        int date = ((s[2] - '0') * 10 + s[3] - '0') * 12 * 31 + ((s[5] - '0') * 10 + s[6] - '0') * 31 + ((s[8] - '0') * 10 + s[9] - '0');
-        if (date < 0) {
-            cerr << "Date at beginning of line corresponding to bar " << currentFileBar << " in file " << address << " was before 2000/01/01.\n\n";
-            exit(1);
-        }
-        if (date >= 11160) {
-            cerr << "Date at beginning of line corresponding to bar " << currentFileBar << " in file " << address << " was past 2030/01/01.\n\n";
-            exit(1);
-        }
+    if(fileLineSpot1 - fileLineSpot < 18 || fileLineSpot1 - fileLineSpot > 19){
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " does not have the correct Unix time format. The value must be 18 or 19 digits long.\n\n";
+        exit(1);
+    }
 
-        int dateIndex = -1;
+    for(int i=fileLineSpot;i<fileLineSpot1-9;i++){
+        unix *= 10;
+        unix += fileLine[i] - '0';
+    }
+    
+    if(unix < 946702800 || unix >= 1893474000){
+        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " does not have the correct Unix time format. The value (excluding the last 9 digits) must be between 946702800 (Jan 1, 2000, 12:00 AM EST) and 1893474000 (Jan 1, 2030, 12:00 AM EST). It is " << unix << ".\n\n";
+        exit(1);
+    }
+    
+    // convert to date and time (year, month, day are 0-indexed) example output: 202503160930
+    vector<int> yearStarts = {946702800, 978325200, 1009861200, 1041397200, 1072933200, 1104555600, 1136091600, 1167627600, 1199163600, 1230786000, 1262322000,
+    1293858000, 1325394000, 1357016400, 1388552400, 1420088400, 1451624400, 1483246800, 1514782800, 1546318800, 1577854800, 1609477200, 1641013200, 1672549200,
+    1704085200, 1735707600, 1767243600, 1798779600, 1830315600, 1861938000, 1893474000};
+    vector<int> monthDays = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365};
 
-        // plug this date into date to index to see if it has been recorded yet
-        if (d[date] != DUMMY_INT) {
-            dateIndex = d[date];
-        }
-        else {
-            d[date] = numDates;
-            D.push_back(date);
-            dateIndex = numDates;
-            numDates++;
-        }
+    long long dateTime = 20000000;
+    int yearStart = 946702800;
 
-        // handle dates that are out of order
-        if (dateIndex > 0) {
-            if (D[dateIndex - 1] > D[dateIndex]) {
-                string dateString1 = "";
-                vector<char> dateVector1 = dateToString(d[dateIndex - 1]);
-                for (int i = 0; i < size(dateVector1); i++) {
-                    dateString1 += dateVector1[i];
-                }
-                string dateString2 = "";
-                vector<char> dateVector2 = dateToString(d[dateIndex]);
-                for (int i = 0; i < size(dateVector2); i++) {
-                    dateString2 += dateVector2[i];
-                }
-                cerr << "Consecutively parsed dates " << dateString1 << " and " << dateString2 << " were not entered in ascending order.\n\n";
-                exit(1);
-            }
+    int year = 0;
+    for(int i=1;i<=30;i++){
+        if(yearStarts[i] > unix){
+            year = i - 1;
+            yearStart = yearStarts[year];
+            dateTime = 20000000 + year * 10000;
+            break;
         }
-
-        // moving to dummy values
-        int spot = 16;
-        while (s[spot] != ',') {
-            spot++;
-            if (spot >= n) {
-                cerr << "Bar " << currentFileBar << " in file " << address << " ended without a comma after the time " << time << " .\n\n";
-                exit(1);
-            }
-        }
-
-        // moving past dummy values
-        for (int i = 0; i < numDummyValuesAfterTime; i++) {
-            spot++;
-            while (s[spot] != ',') {
-                spot++;
-                if (spot >= n) {
-                    cerr << "Bar " << currentFileBar << " in file " << address << " ended without a comma after dummy value " << i << " .\n\n";
-                    exit(1);
-                }
-            }
-        }
-
-        // ticker symbol
-        vector<char> ticker;
-        int tickerSpot = n - 2;
-        while (s[tickerSpot] != ',') {
-            tickerSpot--;
-        }
-        for (int i = tickerSpot + 1; i < n; i++) {
-            ticker.push_back(s[i]);
-        }
-        bool tickerFound = 0;
-        int tickerIndex = -1;
-        for (int i = 0; i < size(t); i++) {
-            if (t[i] == ticker) {
-                tickerFound = 1;
-                tickerIndex = i;
-                break;
-            }
-        }
-        if (!tickerFound) {
-            tickerIndex = size(t);
-            t.push_back(ticker);
-        }
-
-        // OHLCV values
-        for (int i = 0; i < 5; i++) {
-            spot++;
-            int subSpot = spot + 1;
-            while (s[subSpot] != ',' && s[subSpot] != '.') {
-                subSpot++;
-                if (subSpot >= n) {
-                    cerr << "Bar " << currentFileBar << " in file " << address << " ended without a comma after OHLCV value " << i << " .\n\n";
-                    exit(1);
-                }
-            }
-            int num = 0;
-            // get digits before .
-            for (int j = spot; j < subSpot; j++) {
-                if (i == 4) { // volume stores value
-                    num += (s[j] - '0') * (int)power(10, subSpot - j - 1);
-                }
-                else { // others store 100 * value
-                    num += (s[j] - '0') * (int)power(10, subSpot - j + 1);
-                }
-            }
-            // get two digits after .
-            if (s[subSpot] == '.') {
-                subSpot += 2;
-                if (subSpot >= n) {
-                    cerr << "Bar " << currentFileBar << " in file " << address << " ended without two characters after the decimal point of OHLCV value " << i << " .\n\n";
-                    exit(1);
-                }
-                if (s[subSpot - 1] != ',') {
-                    num += (s[subSpot - 1] - '0') * 10;
-                    if (s[subSpot] != ',') {
-                        num += (s[subSpot] - '0');
+    }
+    
+    int dayOfYear = (unix - yearStart) / 86400;
+    char month = 0;
+    char dayOfMonth = 0;
+    if(year % 4 == 0){
+        if(dayOfYear == 59){
+            dateTime += 200;
+            dayOfMonth = 28;
+        }else{
+            if(dayOfYear > 59){
+                dayOfYear--;
+                for(int i=1;i<=12;i++){
+                    if(monthDays[i] > dayOfYear){
+                        dateTime += i * 100;
+                        dayOfMonth = dayOfYear - monthDays[i - 1];
+                        break;
                     }
                 }
             }
-
-            // handle array overflows
-            if (tickerIndex >= maxNumSymbols) {
-                cerr << "Bar " << currentFileBar << " in file " << address << " overflowed the maximum number of ticker symbols allocated: " << maxNumSymbols << " .\n\n";
-                exit(1);
-            }
-            if (dateIndex >= maxNumDates) {
-                cerr << "Bar " << currentFileBar << " in file " << address << " overflowed the maximum number of dates allocated: " << maxNumDates << " .\n\n";
-                exit(1);
-            }
-            if (selectedTimeIndex >= numStoredTimes) {
-                cerr << "Bar " << currentFileBar << " in file " << address << " overflowed the maximum number of stored times per day allocated: " << numStoredTimes << " .\n\n";
-                exit(1);
-            }
-
-            // add this volume (if currently reading volume) to cumulative volume for this symbol and date
-            if (i == 4) {
-                totalVolume[tickerIndex][dateIndex] += num;
-            }
-
-            // add data to OHLCV arrays
-            int a = selectedTimeIndex + (dateIndex + tickerIndex * maxNumDates) * numStoredTimes;
-            switch (i) {
-            case 0:
-                if (selectedMetrics[selectedTimeIndex] == 'o') p[a] = num;
-                break;
-            case 1:
-                if (selectedMetrics[selectedTimeIndex] == 'h') p[a] = num;
-                break;
-            case 2:
-                if (selectedMetrics[selectedTimeIndex] == 'l') p[a] = num;
-                break;
-            case 3:
-                if (selectedMetrics[selectedTimeIndex] == 'c') p[a] = num;
-                //priceSweeper[tickerIndex] = num;    // update the price sweeper's value for this symbol to fill in future holes
-                break;
-            case 4:
-                if (selectedMetrics[selectedTimeIndex] == 'v') p[a] = num;
+        }
+    }else{
+        for(int i=1;i<=12;i++){
+            if(monthDays[i] > dayOfYear){
+                dateTime += i * 100;
+                dayOfMonth = dayOfYear - monthDays[i - 1];
                 break;
             }
-
-            // move to next comma in case we're in the middle of many decimal places
-            while (s[subSpot] != ',') {
-                subSpot++;
-                if (subSpot >= n) {
-                    cerr << "Bar " << currentFileBar << " in file " << address << " ended without a comma after OHLCV value " << i << " .\n\n";
-                    exit(1);
-                }
-            }
-            spot = subSpot;
         }
     }
 
+    int time = ((unix - 14400) / 60) % 1440;
+
+    time = (time / 60) * 100 + (time % 60);
+
+    dateTime = dateTime * 10000 + time;
+    
+    return dateTime;
+}
+
+// parse an OHLCV value within a CSV file line
+int parseOHLCV(char ohlcvCode){
+    
+    while (fileLine[fileLineSpot1] != ',' && fileLine[fileLineSpot1] != '.') {
+        fileLineSpot1++;
+        if (fileLineSpot1 >= fileLineLength) {
+            break;
+        }
+    }
+    int num = 0;
+    // get digits before .
+    for (int j = fileLineSpot; j < fileLineSpot1; j++) {
+        if (ohlcvCode == 'V') { // volume stores value
+            num += (fileLine[j] - '0') * (int)power(10, fileLineSpot1 - j - 1);
+        }
+        else { // others store 100 * value
+            num += (fileLine[j] - '0') * (int)power(10, fileLineSpot1 - j + 1);
+        }
+    }
+    // get two digits after .
+    if (fileLine[fileLineSpot1] == '.') {
+        fileLineSpot1++;
+        if(fileLineSpot1 < fileLineLength){
+            if (fileLine[fileLineSpot1] != ',') {
+                num += (fileLine[fileLineSpot1 - 1] - '0') * 10;
+                fileLineSpot1++;
+                if(fileLineSpot1 < fileLineLength){
+                    if (fileLine[fileLineSpot1] != ',') {
+                        num += (fileLine[fileLineSpot1] - '0');
+                    }
+                }
+            }
+        }
+    }
+
+    return num;
+}
+
+void checkColumnCodes(){
+    int numS = 0, numM = 0, numD = 0, numT = 0, numO = 0, numH = 0, numL = 0, numC = 0, numV = 0;
+    int n = size(columnCodes);
+    if(n < 3 || n > 20){
+        cerr << "The length of the CSV column code must be from 3 to 20 characters long. It is " << n << "characters long.\n\n";
+        exit(1);
+    }
+    for(int i=0;i<n;i++){
+        switch(columnCodes[i]){
+            case 'S':
+                numS++;
+                break;
+            case 'M':
+            case 'U':
+                numM++;
+                break;
+            case 'D':
+                numD++;
+                break;
+            case 'T':
+                numT++;
+                break;
+            case 'O':
+                numO++;
+                break;
+            case 'H':
+                numH++;
+                break;
+            case 'L':
+                numL++;
+                break;
+            case 'C':
+                numC++;
+                break;
+            case 'V':
+                numV++;
+                break;
+            case '-':
+                break;
+            cerr << "The CSV column code may only contain the characters \"MDTSOHLCV-\".\n\n";
+            exit(1);
+        }
+    }
+
+    if(numS != 1){
+        cerr << "The CSV column code must contain exactly one symbol value (S).\n\n";
+        exit(1);
+    }
+    if(numM > 1 || numD > 1 || numT > 1){
+        cerr << "The CSV column code must contain no more than one moment, Unix time, time, or date value (M/U/T/D).\n\n";
+        exit(1);
+    }
+    if((numM != 1 && (numD != 1 || numT != 1)) || (numM == 1 && (numD == 1 || numT == 1))){
+        cerr << "The CSV column code must contain exactly one moment or Unix time value, or one time and one date value (M/U/T/D).\n\n";
+        exit(1);
+    }
+    if(numO != 1){
+        cerr << "The CSV column code must contain exactly one open value (O).\n\n";
+        exit(1);
+    }
+    if(numH != 1){
+        cerr << "The CSV column code must contain exactly one high value (H).\n\n";
+        exit(1);
+    }
+    if(numL != 1){
+        cerr << "The CSV column code must contain exactly one low value (L).\n\n";
+        exit(1);
+    }
+    if(numC != 1){
+        cerr << "The CSV column code must contain exactly one close value (C).\n\n";
+        exit(1);
+    }
+    if(numV != 1){
+        cerr << "The CSV column code must contain exactly one volume value (V).\n\n";
+        exit(1);
+    }
+}
+
+// make sure the stored times and metrics are formatted properly
+void checkStoredTimes(){
+    if(numStoredTimes != size(storedTimes) || numStoredTimes != size(storedMetrics)){
+        cerr << "The number of stored times, size of the storedTimes vector, and size of the storedMetrics vector must all be equal.\n\n";
+        exit(1);
+    }
+
+    for(int i=0;i<numStoredTimes;i++){
+        if(storedTimes[i] < 0 || storedTimes[i] > 2359){
+            cerr << "storedTimes[" << i << "] must be between 0 and 2359.\n\n";
+            exit(1);
+        }
+        if(!(storedMetrics[i] == 'O' || storedMetrics[i] == 'H' || storedMetrics[i] == 'L' || storedMetrics[i] == 'C' || storedMetrics[i] == 'V')){
+            cerr << "storedMetrics[" << i << "] must be O/H/L/C/V.\n\n";
+            exit(1);
+        }
+    }
+}
+
+// scan a file, only sampling symbols and dates
+void scanFile(){
+    int numValuesPerLine = size(columnCodes);
+
+    ifstream f(fileAddress);
+
+    if (!f.is_open()) {
+        cerr << "File " << fileAddress << " was found but could not be opened.\n\n";
+        exit(1);
+    }
+
+    fileLine = "";
+
+    getline(f, fileLine);
+
+    fileLineIndex = -1;
+    while (getline(f, fileLine)) {
+        fileLineIndex++;
+        fileLineSpot = 0;
+        fileLineSpot1 = 0;
+        fileLineLength = fileLine.length();
+
+        if (fileLineLength < 20) {
+            cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " with a length of " << fileLineLength << "characters was incorrectly shorter than 20 characters long. Make sure it includes a date and time, OHLCV values, and a ticker symbol.\n\n";
+            exit(1);
+        }
+
+        int scannedDate = -1;
+        int scannedTime = -1;
+
+        for(int i=0;i<numValuesPerLine;i++){
+            fileLineSpot1 = fileLineSpot;
+
+            // get this value
+            switch(columnCodes[i]){
+                case 'S':{
+                    currentSymbol = parseSymbol();
+                    if (symbol_index.find(currentSymbol) != symbol_index.end()) {
+                        currentSymbolIndex = symbol_index.at(currentSymbol);
+                    }else{
+                        currentSymbolIndex = numSymbols;
+                        symbol_index[currentSymbol] = numSymbols;
+                        index_symbol[numSymbols] = currentSymbol;
+                        numSymbols++;
+                    }
+                    break;
+                }
+                case 'M':{
+                    // scan the moment
+                    currentDateTime = parseMoment();
+                    currentDate = currentDateTime / 10000;
+                    currentTime = currentDateTime % 10000;
+                    if (date_index.find(currentDate) != date_index.end()) {
+                        currentDateIndex = date_index.at(currentDate);
+                    }else{
+                        currentDateIndex = numDates;
+                        date_index[currentDate] = numDates;
+                        index_date[numDates] = currentDate;
+                        numDates++;
+                    }
+                    break;
+                }
+                case 'U':{
+                    // scan the unix timestamp
+                    currentDateTime = parseUnix();
+                    currentDate = currentDateTime / 10000;
+                    currentTime = currentDateTime % 10000;
+                    if (date_index.find(currentDate) != date_index.end()) {
+                        currentDateIndex = date_index.at(currentDate);
+                    }else{
+                        currentDateIndex = numDates;
+                        date_index[currentDate] = numDates;
+                        index_date[numDates] = currentDate;
+                        numDates++;
+                    }
+                    break;
+                }
+                case 'D':{
+                    // scan the date
+                    currentDate = parseDate();
+                    if (date_index.find(currentDate) != date_index.end()) {
+                        currentDateIndex = date_index.at(currentDate);
+                    }else{
+                        currentDateIndex = numDates;
+                        date_index[currentDate] = numDates;
+                        index_date[numDates] = currentDate;
+                        numDates++;
+                    }
+                    break;
+                }
+                case 'T':{
+                    // scan the time
+                    // nothing needed
+                    break;
+                }
+            }
+
+
+            // move past next comma
+            if(i < numValuesPerLine - 1){
+                while (fileLine[fileLineSpot] != ',') {
+                    fileLineSpot++;
+                    if (fileLineSpot >= fileLineLength) {
+                        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " ended without a comma after value " << i << ". According to the columnCodes you entered, there should be " << numValuesPerLine << " values and " << numValuesPerLine - 1 << " commas.\n\n";
+                        exit(1);
+                    }
+                }
+            }
+            fileLineSpot++;
+        }
+
+        
+    }
+
     f.close();
-    return 1;
+}
+
+void scanAllFiles(string path){
+
+    checkColumnCodes();
+
+    cout << "Scanning files in folder " << path << "... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
+    numFiles = size(filesToRead);
+    for (const auto& entry : fs::directory_iterator(path)){
+        fileAddress = entry.path().string();
+        if(numFiles > 0){
+            for(int i=0;i<numFiles;i++){
+                if(filesToRead[i] == fileAddress){
+                    scanFile();
+                    break;
+                }
+            }
+        }else{
+            scanFile();
+        }
+    }
+
+    cout << "Finished scanning " << numFiles << " files.\n\n";
+    
+}
+
+void readFile(){
+    int numValuesPerLine = size(columnCodes);
+
+    ifstream f(fileAddress);
+
+    if (!f.is_open()) {
+        cerr << "File " << fileAddress << " was found but could not be opened.\n\n";
+        exit(1);
+    }
+
+    int previousTime = DUMMY_INT;
+
+    fileLine = "";
+
+    getline(f, fileLine);
+
+    fileLineIndex = -1;
+    while (getline(f, fileLine)) {
+        fileLineIndex++;
+        fileLineSpot = 0;
+        fileLineSpot1 = 0;
+        fileLineLength = fileLine.length();
+
+        if (fileLineLength < 20) {
+            cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " with a length of " << fileLineLength << "characters was incorrectly shorter than 20 characters long. Make sure it includes a date and time, OHLCV values, and a ticker symbol.\n\n";
+            exit(1);
+        }
+
+        bool skip = 0;
+
+        // get every value in the line, then afterwards organize the values
+        for(int i=0;i<numValuesPerLine;i++){
+            fileLineSpot1 = fileLineSpot;
+
+            // get this value
+            switch(columnCodes[i]){
+                case 'S':{
+                    currentSymbol = parseSymbol();
+                    if (symbol_index.find(currentSymbol) != symbol_index.end()) {
+                        currentSymbolIndex = symbol_index.at(currentSymbol);
+                    }else{
+                        currentSymbolIndex = numSymbols;
+                        symbol_index[currentSymbol] = numSymbols;
+                        index_symbol[numSymbols] = currentSymbol;
+                        numSymbols++;
+                    }
+                    break;
+                }
+                case 'M':{
+                    currentDateTime = parseMoment();
+                    currentDate = currentDateTime / 10000;
+                    currentTime = currentDateTime % 10000;
+                    currentTimeIndex = -1;
+                    for(int i=0;i<numStoredTimes;i++){
+                        if(storedTimes[i] == currentTime){
+                            currentTimeIndex = i;
+                            break;
+                        }
+                    }
+                    if(currentTimeIndex == -1){
+                        skip = 1;
+                        break;
+                    }
+                    if (date_index.find(currentDate) != date_index.end()) {
+                        currentDateIndex = date_index.at(currentDate);
+                    }else{
+                        currentDateIndex = numDates;
+                        date_index[currentDate] = numDates;
+                        index_date[numDates] = currentDate;
+                        numDates++;
+                    }
+                    break;
+                }
+                case 'D':{
+                    currentDate = parseDate();
+                    if (date_index.find(currentDate) != date_index.end()) {
+                        currentDateIndex = date_index.at(currentDate);
+                    }else{
+                        currentDateIndex = numDates;
+                        date_index[currentDate] = numDates;
+                        index_date[numDates] = currentDate;
+                        numDates++;
+                    }
+                    break;
+                }
+                case 'T':{
+                    currentTime = parseTime();
+                    currentTimeIndex = -1;
+                    for(int i=0;i<numStoredTimes;i++){
+                        if(storedTimes[i] == currentTime){
+                            currentTimeIndex = i;
+                            break;
+                        }
+                    }
+                    if(currentTimeIndex == -1){
+                        skip = 1;
+                        break;
+                    }
+                    break;
+                }
+                case 'O':{
+                    currentOHLCV[0] = parseOHLCV('O');
+                    break;
+                }
+                case 'H':{
+                    currentOHLCV[1] = parseOHLCV('H');
+                    break;
+                }
+                case 'L':{
+                    currentOHLCV[2] = parseOHLCV('L');
+                    break;
+                }
+                case 'C':{
+                    currentOHLCV[3] = parseOHLCV('C');
+                    break;
+                }
+                case 'V':{
+                    currentOHLCV[4] = parseOHLCV('V');
+                    break;
+                }
+                case 'U':{
+                    currentDateTime = parseUnix();
+                    currentDate = currentDateTime / 10000;
+                    currentTime = currentDateTime % 10000;
+                    currentTimeIndex = -1;
+                    for(int i=0;i<numStoredTimes;i++){
+                        if(storedTimes[i] == currentTime){
+                            currentTimeIndex = i;
+                            break;
+                        }
+                    }
+                    if(currentTimeIndex == -1){
+                        skip = 1;
+                        break;
+                    }
+                    if (date_index.find(currentDate) != date_index.end()) {
+                        currentDateIndex = date_index.at(currentDate);
+                    }else{
+                        currentDateIndex = numDates;
+                        date_index[currentDate] = numDates;
+                        index_date[numDates] = currentDate;
+                        numDates++;
+                    }
+                    break;
+                }
+            }
+
+            // exit line to skip it because this bar's time is not one of the storedTimes
+            if(skip){
+                break;
+            }
+
+            // move to next comma if there is a next comma
+            if(i < numValuesPerLine - 1){
+                while (fileLine[fileLineSpot] != ',') {
+                    fileLineSpot++;
+                    if (fileLineSpot >= fileLineLength) {
+                        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " ended without a comma after value " << i << ". According to the columnCodes you entered, there should be " << numValuesPerLine << " values and " << numValuesPerLine - 1 << " commas.\n\n";
+                        exit(1);
+                    }
+                }
+            }
+            // move past it
+            fileLineSpot++;
+        }
+
+        // handle dates that are out of order (must be non-decreasing across bars, including bars from different files)
+        if (currentDateIndex > 0) {
+            if (index_date.at(currentDateIndex - 1) > index_date.at(currentDateIndex)) {
+                cerr << "Consecutively parsed dates " << dateToString(index_date.at(currentDateIndex - 1)) << " and " << dateToString(index_date.at(currentDateIndex)) << " were not entered in ascending order. This was because the file was not scanned correctly before reading.\n\n";
+                exit(1);
+            }
+        }
+
+        // debugging
+        //if(currentDateIndex == 0 && currentSymbolIndex < 10){
+        //    cout << currentSymbolIndex << " " << currentOHLCV[0] << " " << currentOHLCV[1] << " " << currentOHLCV[2] << " " << currentOHLCV[3] << " " << currentOHLCV[4] << " ";
+        //    cout << currentSymbol << " " << currentDateTime << " " << currentDateIndex << " " << currentTimeIndex << "\n";
+        //}
+
+        // determine if this bar is the first one past any number of times stored
+        for(int i=0;i<numStoredTimes;i++){
+            if(currentTime > storedTimes[i] && previousTime <= storedTimes[i] && previousTime != DUMMY_INT && priceSweeper[currentSymbolIndex] != DUMMY_INT){
+                // if ascended past, get the ohlcv value as the price sweeper value (last close recorded)
+                int a = i + (currentDateIndex + currentSymbolIndex * maxNumDates) * numStoredTimes;
+                p[a] = priceSweeper[currentSymbolIndex];
+                index_symbol_day[currentDateIndex][numPointsByDateIndex[currentDateIndex]] = currentSymbol;
+                symbol_index_day[currentDateIndex][currentSymbol] = numPointsByDateIndex[currentDateIndex];
+                numPointsByDateIndex[currentDateIndex]++;
+
+                cout << index_symbol.at(currentSymbolIndex) << " " << currentTime << " " << previousTime << " " << storedTimes[i] << " " << numPointsByDateIndex[currentDateIndex] << " " << i << " " << p[a];
+            }
+            if(currentTime < storedTimes[i] && previousTime >= storedTimes[i] && previousTime != DUMMY_INT && priceSweeper[currentSymbolIndex] != DUMMY_INT){
+                // if descended past, get the ohlcv value as the price sweeper value (last close recorded)
+                int a = i + (currentDateIndex + currentSymbolIndex * maxNumDates) * numStoredTimes;
+                p[a] = priceSweeper[currentSymbolIndex];
+                numPointsByDateIndex[currentDateIndex]++;
+            }
+        }
+
+        // update the previous time
+        previousTime = currentTime;
+
+        // update the price sweeper for this symbol with the last close recorded
+        priceSweeper[currentSymbolIndex] = currentOHLCV[3];
+
+        // skip line if not one of the stored times
+        if(skip){
+            continue;
+        }
+
+        // get the ohlcv value depending on the storedMetric
+        int a = currentTimeIndex + (currentDateIndex + currentSymbolIndex * maxNumDates) * numStoredTimes;
+        switch(storedMetrics[currentTimeIndex]){
+            case 'O':
+                p[a] = currentOHLCV[0];
+                break;
+            case 'H':
+                p[a] = currentOHLCV[1];
+                break;
+            case 'L':
+                p[a] = currentOHLCV[2];
+                break;
+            case 'C':
+                p[a] = currentOHLCV[3];
+                break;
+            case 'V':
+                p[a] = currentOHLCV[4];
+                totalVolume[currentSymbolIndex][currentDateIndex] += currentOHLCV[4];
+                break;
+        }
+        numPointsByDateIndex[currentDateIndex]++;
+        
+    }
+
+    f.close();
 }
 
 // read every file in the folder given by this address
-void readAll(string path) {
+void readAllFiles(string path) {
+
+    checkColumnCodes();
+
+    checkStoredTimes();
+
     cout << "Reading files in folder " << path << "... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
-    string a = path + "\\0.csv";
-    numFiles = 0;
-    while (read(a, 3)) {
-        numFiles++;
-        a = path + "\\" + to_string(numFiles) + ".csv";
+    numFiles = size(filesToRead);
+    for (const auto& entry : fs::directory_iterator(path)){
+        fileAddress = entry.path().string();
+        if(numFiles > 0){
+            for(int i=0;i<numFiles;i++){
+                if(filesToRead[i] == fileAddress){
+                    readFile();
+                    break;
+                }
+            }
+        }else{
+            readFile();
+        }
     }
+
     cout << "Finished reading " << numFiles << " files.\n\n";
 }
 
@@ -331,18 +863,16 @@ void setup() {
         p[i] = DUMMY_INT;
     }
 
-    for (i = 0; i < 11160; i++) {
-        d[i] = DUMMY_INT;
+    numDates = 0;
+    numSymbols = 0;
+    numAllowedTickers = 0;
+    for(int i=0;i<maxNumDates;i++){
+        numPointsByDateIndex[i] = 0;
     }
 
-    numAllowedTickers = 0;
-
     for (i = 0; i < maxNumSymbols; i++) {
-        //priceSweeper[i] = 0;
+        priceSweeper[i] = DUMMY_INT;
         for (j = 0; j < maxNumDates; j++) {
-            tradeSymbolIndices[j][i] = DUMMY_INT;
-            entries[j][i] = DUMMY_DOUBLE;
-            exits[j][i] = DUMMY_DOUBLE;
 
             totalVolume[i][j] = 0;
         }
@@ -350,8 +880,6 @@ void setup() {
         userTickers[i].clear();
         userVolumes[i] = DUMMY_INT;
         userMarketCaps[i] = DUMMY_INT;
-        allowedTickers[i].clear();
-        allowedToUserIndex[i] = 0;
     }
 }
 
@@ -359,13 +887,24 @@ void setupDateData() {
     cout << "Setting up the date data storage... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
     int i = 0, j = 0, k = 0, l = 0;
 
+    entries = (double**)calloc(numDates, sizeof(double*));
+    exits = (double**)calloc(numDates, sizeof(double*));
+
     // categorize all data points from p[] by date (group into dates)
-    for (i = 0; i < maxNumDates; i++) {
-        numPointsByDateIndex[i] = 0;
+    for (i = 0; i < numDates; i++) {
+        int numPoints = numPointsByDateIndex[i];
 
-        for (j = 0; j < maxNumSymbols; j++) {
+        if(numPoints > maxNumSymbols){
+            cerr << "Number of data points on day " << i << " was greater than the maximum number of symbols allowed for any given date, " << maxNumSymbols << ". Increase maxNumSymbols.\n\n";
+            exit(1);
+        }
 
-            // if all points within this symbol and date are in the dataset (!= DUMMY_INT), store the entry and exit for this symbol and day within a temp array and increment # symbols on this day
+        double* entriesDay = (double*)calloc(numPoints, sizeof(double));
+        double* exitsDay = (double*)calloc(numPoints, sizeof(double));
+
+        for (j = 0; j < numPoints; j++) {
+
+            // if all points (for different storedTimes) within this symbol and date are in the dataset (!= DUMMY_INT), store the entry and exit for this symbol and day within a temp array and increment # symbols on this day
             bool allPointsTodayFound = 1;
             // location of the point of this date and symbol (first time) within p[]
             int index = (i + j * maxNumDates) * numStoredTimes;
@@ -376,74 +915,94 @@ void setupDateData() {
             }
             if (allPointsTodayFound) {
                 // get the index of the symbol traded at this date and symbol
-                tradeSymbolIndices[i][numPointsByDateIndex[i]] = j;
+                
                 // calculation of entries and exits (depends on strategy)
-                entries[i][numPointsByDateIndex[i]] = (100.0 * (double)(p[index + 1] - p[index + 0]) / (double)p[index + 0]);
-                exits[i][numPointsByDateIndex[i]] = (100.0 * (double)(p[index + 2] - p[index + 1]) / (double)p[index + 1]);
-                // increment number of symbols on this day
-                numPointsByDateIndex[i]++;
+                entriesDay[j] = (100.0 * (double)(p[index + 1] - p[index + 0]) / (double)p[index + 0]);
+                exitsDay[j] = (100.0 * (double)(p[index + 2] - p[index + 1]) / (double)p[index + 1]);
+                if(i == 0 && j < 10){
+                    cout << j << " " << index_symbol.at(j) << " " << p[index] << " " << p[index+1] << " " << p[index+2] << "\n";
+                }
             }
         }
+
+        entries[i] = entriesDay;
+        exits[i] = exitsDay;
     }
 
     // sort the data within every day of points[]
     double temp = 0.0;
-    int tempi = 0;
+    string temps = "";
     int numBuckets = 10000;
-    vector<vector<double>> buckets(numBuckets, vector<double>(0, 0.0));
+    vector<vector<double>> bucketsEntries(numBuckets, vector<double>(0, 0.0));
     vector<vector<double>> bucketsExits(numBuckets, vector<double>(0, 0.0));
-    vector<vector<int>> bucketsIndices(numBuckets, vector<int>(0, 0));
+    vector<vector<string>> bucketsSymbols(numBuckets, vector<string>(0, ""));
     double maxVal = (double)INT_MIN;
     double minVal = (double)INT_MAX;
-    for (i = 0; i < maxNumDates; i++) {
+    for (i = 0; i < numDates; i++) {
 
         int numPoints = numPointsByDateIndex[i];
         if (numPoints == 0) continue;
         // get the range of values to initialize the buckets
         for (j = 0; j < numPoints; j++) {
+            // if any entries are empty, exit
+            if(entries[i][j] == DUMMY_DOUBLE){
+                cerr << "Entries[" << i << "][" << j << "] was empty.\n\n";
+                exit(1);
+            }
+            if(exits[i][j] == DUMMY_DOUBLE){
+                cerr << "Exits[" << i << "][" << j << "] was empty.\n\n";
+                exit(1);
+            }
+
             if (entries[i][j] < minVal) minVal = entries[i][j];
             if (entries[i][j] > maxVal) maxVal = entries[i][j] * 1.0001;
         }
         // clear all buckets from previous use
         for (j = 0; j < numBuckets; j++) {
-            buckets[j].clear();
+            bucketsEntries[j].clear();
         }
+        double range = maxVal - minVal;
+        // if all values are the same, no need to sort (buckets wouldn't work anyway)
+        if(range == 0){
+            continue;
+        }
+        int index = 0;
         // fill the buckets with the values to be sorted
         for (j = 0; j < numPoints; j++) {
-            int index = (int)((double)numBuckets * (entries[i][j] - minVal) / (maxVal - minVal));
-            buckets[index].push_back(entries[i][j]);
+            index = (int)((double)numBuckets * (entries[i][j] - minVal) / range);
+            bucketsEntries[index].push_back(entries[i][j]);
             bucketsExits[index].push_back(exits[i][j]);
-            bucketsIndices[index].push_back(tradeSymbolIndices[i][j]);
+            bucketsSymbols[index].push_back(index_symbol_day[i][j]);
         }
         // iterate over the buckets
         for (j = 0; j < numBuckets; j++) {
             // sort them using exchange sort
-            for (k = 0; k < size(buckets[j]); k++) {
-                for (l = k + 1; l < size(buckets[j]); l++) {
-                    if (buckets[j][k] < buckets[j][l]) {
-                        temp = buckets[j][k];
-                        buckets[j][k] = buckets[j][l];
-                        buckets[j][l] = temp;
+            for (k = 0; k < size(bucketsEntries[j]); k++) {
+                for (l = k + 1; l < size(bucketsEntries[j]); l++) {
+                    if (bucketsEntries[j][k] < bucketsEntries[j][l]) {
+                        temp = bucketsEntries[j][k];
+                        bucketsEntries[j][k] = bucketsEntries[j][l];
+                        bucketsEntries[j][l] = temp;
 
                         temp = bucketsExits[j][k];
                         bucketsExits[j][k] = bucketsExits[j][l];
                         bucketsExits[j][l] = temp;
 
-                        tempi = bucketsIndices[j][k];
-                        bucketsIndices[j][k] = bucketsIndices[j][l];
-                        bucketsIndices[j][l] = tempi;
+                        temps = bucketsSymbols[j][k];
+                        bucketsSymbols[j][k] = bucketsSymbols[j][l];
+                        bucketsSymbols[j][l] = temps;
                     }
                 }
             }
         }
 
         // concatenate the buckets for all data types
-        int index = 0;
+        index = 0;
         for (j = 0; j < numBuckets; j++) {
-            for (k = 0; k < size(buckets[j]); k++) {
-                entries[i][index] = buckets[j][k];
+            for (k = 0; k < size(bucketsEntries[j]); k++) {
+                entries[i][index] = bucketsEntries[j][k];
                 exits[i][index] = bucketsExits[j][k];
-                tradeSymbolIndices[i][index] = bucketsIndices[j][k];
+                index_symbol_day[i][index] = bucketsSymbols[j][k];
                 index++;
             }
         }
@@ -454,33 +1013,17 @@ void setupDateData() {
     }
 }
 
-int dateToIndex(int date) {
-    return (((date / 10000) % 100) * 12 + ((date / 100) % 100)) * 31 + (date % 100);
-}
-
 void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, long long minPreviousVolume, long long maxPreviousVolume, int previousVolumeLookBackLength, double leverage, bool disregardFilters) {
     cout << "Backtesting with " << numAllowedTickers << " symbols allowed to trade... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
-    /*
-    if (startingDate < 20000000 || startingDate > 20291231) {
-        cerr << "Starting date " << startingDate << " must be between 20000000 and 20291231.\n\n";
+
+    if(numDates < 1){
+        cerr << "The number of dates found in the dataset was " << numDates << ". It must be at least 1 to backtest.\n\n";
         exit(1);
     }
-    if (endingDate < 20000000 || endingDate > 20291231) {
-        cerr << "Ending date " << endingDate << " must be between 20000000 and 20291231.\n\n";
+    if(numSymbols < 1){
+        cerr << "The number of ticker symbols found in the dataset was " << numSymbols << ". It must be at least 1 to backtest.\n\n";
         exit(1);
     }
-    
-    int sd = d[dateToIndex(startingDate)];
-    if (sd == DUMMY_INT) {
-        cerr << "Starting date " << startingDate << " is on a weekend or another day without recorded data.\n\n";
-        exit(1);
-    }
-    int ed = d[dateToIndex(endingDate)];
-    if (ed == DUMMY_INT) {
-        cerr << "Ending date " << endingDate << " is on a weekend or another day without recorded data.\n\n";
-        exit(1);
-    }
-    */
     
     if (startingDateIndex < 0) startingDateIndex = numDates + startingDateIndex;
     if (startingDateIndex < 0) startingDateIndex = 0;
@@ -494,32 +1037,36 @@ void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, 
     double won = 0.0, lost = 0.0, total = 0.0;
     double balance = 1.0;
 
-    int tradingSymbol = 0;
+    int tradeSymbolIndexByDate = 0;
     long long previousVolume = 0;
 
     for (int dateIndex = startingDateIndex; dateIndex <= endingDateIndex; dateIndex++) {
 
         // if (numSymbolsPerDay > numPointsByDateIndex[dateIndex]) continue;
 
-        tradingSymbol = -1;
+        tradeSymbolIndexByDate = -1;
 
         for (int i = 0; i < numSymbolsPerDay; i++) {
             
             // find the next symbol that is allowed, quit for this day if all symbols have been checked
             bool flag = 1;
             while (flag) {
-                tradingSymbol++;
-                if (tradingSymbol >= numPointsByDateIndex[dateIndex]) break;
+                tradeSymbolIndexByDate++;
+                if (tradeSymbolIndexByDate >= numPointsByDateIndex[dateIndex]){
+                    break;
+                }
 
                 previousVolume = 0;
-                int tradeSymbolIndex = tradeSymbolIndices[dateIndex][tradingSymbol];
+                string tradeSymbol = index_symbol_day[dateIndex].at(tradeSymbolIndexByDate);
+                int tradeSymbolIndex = symbol_index.at(tradeSymbol);
 
                 // add up all previous day volumes if previous days existed
                 for (int j = 0; j < previousVolumeLookBackLength; j++) {
                     if (dateIndex - j - 1 >= 0) {
-                        previousVolume += totalVolume[tradeSymbolIndex][dateIndex - j - 1];
+                        previousVolume += totalVolume[symbol_index.at(tradeSymbol)][dateIndex - j - 1];
                     }
                     else {
+                        // stop if reaching day 0
                         break;
                     }
                 }
@@ -537,12 +1084,12 @@ void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, 
                     flag = 1;
 
                     // determine if this symbol is allowed via its index. if it is allowed, the loop will end
-                    if (tradeSymbolIndex < 0 || tradeSymbolIndex >= size(t)) {
+                    if (tradeSymbolIndex < 0 || tradeSymbolIndex >= numSymbols) {
                         cerr << "Index of symbol to trade (" << tradeSymbolIndex << ") is out of the range of the number of all tickers in the dataset.\n\n";
                         exit(1);
                     }
                     for (int j = 0; j < numAllowedTickers; j++) {
-                        if (t[tradeSymbolIndex] == allowedTickers[j]) {
+                        if (tradeSymbol == index_allowed.at(j)) {
                             flag = 0;
                             break;
                         }
@@ -550,10 +1097,11 @@ void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, 
                 }
             }
 
-            if (tradingSymbol >= numPointsByDateIndex[dateIndex]) break;;
+            if (tradeSymbolIndexByDate >= numPointsByDateIndex[dateIndex]) break;;
 
             // trade this symbol
-            double result = exits[dateIndex][tradingSymbol];
+            double result = exits[dateIndex][tradeSymbolIndexByDate];
+            cout << result << " " << dateIndex << " " << tradeSymbolIndexByDate << "\n";
             if (result > 0.0) {
                 wins++;
                 won += result;
@@ -631,14 +1179,14 @@ string formatSymbolList(string list, string from, string to, string start, strin
 }
 
 // helper function for extractSymbolData
-vector<char> extractTicker(vector<char> s, int i, int spot) {
+string extractTicker(vector<char> s, int i, int spot) {
     int l = size(s);
-    vector<char> o;
+    string o = "";
     while (spot < l) {
         if ((s[spot] < 'a' || s[spot] > 'z') && (s[spot] < 'A' || s[spot] > 'Z') && s[spot] != '.') {
             return o;
         }
-        o.push_back(s[spot]);
+        o += s[spot];
         spot++;
     }
     return o;
@@ -796,8 +1344,8 @@ void filterSymbols(long long minVolume, long long maxVolume, long long minMarket
     numAllowedTickers = 0;
     for (int i = 0; i < maxNumSymbols; i++) {
         if (size(userTickers[i]) > 0 && userVolumes[i] >= minVolume && userVolumes[i] <= maxVolume && userMarketCaps[i] >= minMarketCap && userMarketCaps[i] <= maxMarketCap) {
-            allowedTickers[numAllowedTickers] = userTickers[i];
-            allowedToUserIndex[numAllowedTickers] = i;
+            allowed_index[userTickers[i]] = numAllowedTickers;
+            index_allowed[numAllowedTickers] = userTickers[i];
             numAllowedTickers++;
         }
     }
@@ -826,16 +1374,14 @@ void printUserSymbols(bool printVolumeAndMarketCap) {
 void printAllowedSymbols(bool printVolumeAndMarketCap) {
     cout << "Printing " << numAllowedTickers << " allowed symbols.\n";
     for (int i = 0; i < numAllowedTickers; i++) {
-        if (size(allowedTickers[i]) > 0) {
-            for (int j = 0; j < size(allowedTickers[i]); j++) {
-                cout << allowedTickers[i][j];
-            }
-            if (printVolumeAndMarketCap) {
-                cout << " " << userVolumes[allowedToUserIndex[i]] << " " << userMarketCaps[allowedToUserIndex[i]] << "\n";
-            }
-            else {
-                cout << " ";
-            }
+        for (int j = 0; j < size(index_allowed[i]); j++) {
+            cout << index_allowed[i][j];
+        }
+        if (printVolumeAndMarketCap) {
+            cout << " " << userVolumes[symbol_index.at(index_allowed.at(i))] << " " << userMarketCaps[symbol_index.at(index_allowed.at(i))] << "\n";
+        }
+        else {
+            cout << " ";
         }
     }
     cout << "\nPrinted " << numAllowedTickers << " allowed symbols.\n\n";
@@ -844,21 +1390,29 @@ void printAllowedSymbols(bool printVolumeAndMarketCap) {
 int main() {
     setup();
 
-    readAll("C:\\Minute Stock Data\\");
+    string readPath = "C:\\Minute Stock Data\\";
+    columnCodes = "SVOCHLU-";
+    filesToRead = {"C:\\Minute Stock Data\\2020-05-15.csv"};
+    readAllFiles(readPath);
 
     setupDateData();
 
     vector<string> banned = { "" };
-    extractSymbolData("C:\\Minute Stock Data\\symbolDataNASDAQ.txt", "symbol:", "volume:", "marketCap:", 1, 0, -6);
+    extractSymbolData("C:\\Stock Symbols\\symbolDataNASDAQ.txt", "symbol:", "volume:", "marketCap:", 1, 0, -6);
     filterSymbols(0, LLONG_MAX, 0, LLONG_MAX, banned);
     //printAllowedSymbols(false);
     ////    Comment out either the above line or the line below this to use
-    backtest(0, -1, 1, 0, INT_MAX, 1, 0.1, true);
+    backtest(0, -1, 10, 0, INT_MAX, 1, 0.1, true);
     
     return 0;
 }
 
 /*
+
+EXAMPLE 1 OF COLUMN CODE FORMAT FOR AN EXCERPT FROM A DATA FILE:
+
+moment, unused, unused, unused, open, high, low, close, volume, symbol
+M---OHLCVS
 
 ts_event,rtype,publisher_id,instrument_id,open,high,low,close,volume,symbol
 2025-03-03T09:00:00.000000000Z,33,2,11667,124.560000000,124.750000000,124.390000000,124.490000000,3499,NVDA
@@ -871,5 +1425,24 @@ ts_event,rtype,publisher_id,instrument_id,open,high,low,close,volume,symbol
 2025-03-03T09:02:00.000000000Z,33,2,853,213.230000000,213.260000000,213.000000000,213.000000000,2103,AMZN
 2025-03-03T09:02:00.000000000Z,33,2,11667,124.920000000,124.960000000,124.710000000,124.750000000,5581,NVDA
 2025-03-03T09:03:00.000000000Z,33,2,38,241.450000000,241.600000000,241.350000000,241.600000000,932,AAPL
+
+
+
+EXAMPLE 2 OF COLUMN CODE FORMAT FOR AN EXCERPT FROM A DATA FILE:
+
+symbol, volume, open, close, high, low, unix_time, unused
+SVOCHLU-
+
+ticker,volume,open,close,high,low,window_start,transactions
+A,699,109.21,109.64,109.64,109.21,1747053840000000000,15
+A,31859,110.81,111.27,111.665,110.45,1747056600000000000,336
+A,26947,110.78,111.2,111.2,110.7,1747056660000000000,138
+A,7057,111.125,112.46,112.46,111.12,1747056720000000000,141
+A,13947,112.46,112.5025,112.68,112.41,1747056780000000000,182
+A,20491,112.5,112.93,112.99,112.42,1747056840000000000,258
+A,7357,112.86,113.425,113.425,112.85,1747056900000000000,150
+A,19706,113.52,113.965,114.18,113.39,1747056960000000000,395
+A,6082,114.04,113.965,114.05,113.4901,1747057020000000000,119
+A,5756,113.93,113.66,113.93,113.66,1747057080000000000,88
 
 */
