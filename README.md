@@ -1,9 +1,9 @@
-# Equities_Trading_Intraday_Backtesting_Analysis
-Backtest trading strategies on your own intraday equities data across multiple ticker symbols and dates.
+# Trading_Intraday_Backtesting_Analysis
+Backtest trading strategies on your own intraday market price data across multiple ticker symbols and dates.
 
 Allows filtering by dates, trading volume, and market cap.
 
-Change the readPath in main() to the path local folder containing your intraday equities data files. These files must be named in ascending lexicographical order as the dates of the data within them ascend. Naming files according to date (YYYY-MM-DD) satisfies this requirement. Also, the date-time combinations for every symbol across every file must ascend along with the order of the files.
+Change the readPath in main() to the path local folder containing your intraday price data files. These files must be named in ascending lexicographical order as the dates of the data within them ascend. Naming files according to date (YYYY-MM-DD) satisfies this requirement. Also, the date-time combinations for every symbol across every file must ascend along with the order of the files.
 
 Change filesToRead to the paths of the individual files whose data should be used. Or leave it blank to use every file in the specified directory.
 
