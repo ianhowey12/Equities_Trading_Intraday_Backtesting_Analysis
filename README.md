@@ -3,9 +3,11 @@ Backtest trading strategies on your own intraday equities data across multiple t
 
 Allows filtering by dates, trading volume, and market cap.
 
-Change the readPath in main() to the path local folder containing your intraday equities data files. These files must be named in ascending lexicographical order as the dates of the data within them ascend. Naming files according to date (YYYY-MM-DD) satisfies this requirement.
+Change the readPath in main() to the path local folder containing your intraday equities data files. These files must be named in ascending lexicographical order as the dates of the data within them ascend. Naming files according to date (YYYY-MM-DD) satisfies this requirement. Also, the date-time combinations for every symbol across every file must ascend along with the order of the files.
 
 Change filesToRead to the paths of the individual files whose data should be used. Or leave it blank to use every file in the specified directory.
+
+Change storedTimes and storedMetrics to the data that gets extracted from each symbol on each date. storedTimes should contain the times of the bars being recorded, while storedMetrics should contain the characters ('O'/'H'/'L'/'C'/'V') corresponding to the values extracted from the bars at each of these times. The lengths of these vectors must equal numStoredTimes.
 
 Change columnCodes according to the format of each line in every file. This should be a list of capital letters and dashes corresponding to what each comma-separated value represents.
 
