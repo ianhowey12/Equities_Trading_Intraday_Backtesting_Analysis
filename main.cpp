@@ -12,18 +12,6 @@ namespace fs = std::filesystem;
 
 vector<char> symbolData;
 
-int numFiles = 0;
-
-
-// date to index and back mapping
-int numDates = 0;
-unordered_map<int, int> date_index;
-unordered_map<int, int> index_date;
-
-// symbol to index and back mapping
-int numSymbols = 0;
-unordered_map<string, int> symbol_index;
-unordered_map<int, string> index_symbol;
 
 // data used to read CSV files
 vector<string> filesToRead;
@@ -34,21 +22,26 @@ int fileLineLength = 0;
 int fileLineSpot = 0;
 int fileLineSpot1 = 0;
 
-
 // prices and date indices that have not been filled (inside p[] and d[])
 #define DUMMY_INT INT_MIN
 // empty entries[] and exits[] values (unnecessary)
 #define DUMMY_DOUBLE (double)INT_MIN
 
 #define maxNumSymbols 25000
-#define maxNumDates 1000
+#define maxNumDates 1300
 #define numStoredTimes 3
 // times whose bars should be stored and used to backtest
-vector<int> storedTimes = { 900, 905, 1500 };
+vector<int> storedTimes = { 930, 935, 1500 };
 // metrics (OHLCV) of the bars that should be stored and used to backtest
 vector<int> storedMetrics = { 'O', 'C', 'C' };
 
 string columnCodes = "";
+
+
+int numFiles = 0;
+
+long long numBarsTotal = 0;
+int numBars[maxNumSymbols];
 
 
 // file parsing info
@@ -65,17 +58,36 @@ vector<int> currentOHLCV = {0,0,0,0,0};
 // data points
 int p[maxNumSymbols * maxNumDates * numStoredTimes];
 
-// number of symbols used in each date
-int numPointsByDateIndex[maxNumDates];
 
+// date to index and back mapping
+int numDates = 0;
+unordered_map<int, int> date_index;
+unordered_map<int, int> index_date;
+
+// symbol to index and back mapping (all symbols in dataset)
+int numSymbols = 0;
+unordered_map<string, int> symbol_index;
+unordered_map<int, string> index_symbol;
+
+// number of symbols found in each date
+int numBarsByDateIndex[maxNumDates];
 // values for each day and symbol used to determine trade entry and exit values
 unordered_map<string, int> symbol_index_day[maxNumDates];
 unordered_map<int, string> index_symbol_day[maxNumDates];
+
+// number of symbols with all storedTimes values in p[] filled
+int numFilledByDateIndex[maxNumDates];
+// values for each day and symbol (only ones with all times within that day and symbol filled) used to determine trade entry and exit values
+unordered_map<string, int> symbol_index_sorted[maxNumDates];
+unordered_map<int, string> index_symbol_sorted[maxNumDates];
+
+
 double** entries;
 double** exits;
 
 // values that sweep across all dates, filling in holes in price with last price value recorded for that symbol
 int priceSweeper[maxNumSymbols];
+long long lastDateTime[maxNumSymbols];
 
 // cumulative volume for each symbol and date
 long long totalVolume[maxNumSymbols][maxNumDates];
@@ -240,12 +252,12 @@ long long parseUnix(){
         }
     }
 
-    long long unix = 0;
-
     if(fileLineSpot1 - fileLineSpot < 18 || fileLineSpot1 - fileLineSpot > 19){
         cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " does not have the correct Unix time format. The value must be 18 or 19 digits long.\n\n";
         exit(1);
     }
+
+    long long unix = 0;
 
     for(int i=fileLineSpot;i<fileLineSpot1-9;i++){
         unix *= 10;
@@ -277,29 +289,30 @@ long long parseUnix(){
     }
     
     int dayOfYear = (unix - yearStart) / 86400;
-    char month = 0;
-    char dayOfMonth = 0;
+    int month = 0;
+    int dayOfMonth = 0;
     if(year % 4 == 0){
         if(dayOfYear == 59){
+            month = 2;
             dateTime += 200;
-            dayOfMonth = 28;
+            dayOfMonth = 29;
         }else{
             if(dayOfYear > 59){
                 dayOfYear--;
-                for(int i=1;i<=12;i++){
-                    if(monthDays[i] > dayOfYear){
-                        dateTime += i * 100;
-                        dayOfMonth = dayOfYear - monthDays[i - 1];
+                for(month = 1; month <= 12; month++){
+                    if(monthDays[month] > dayOfYear){
+                        dayOfMonth = dayOfYear - monthDays[month - 1] + 1;
+                        dateTime += month * 100 + dayOfMonth;
                         break;
                     }
                 }
             }
         }
     }else{
-        for(int i=1;i<=12;i++){
-            if(monthDays[i] > dayOfYear){
-                dateTime += i * 100;
-                dayOfMonth = dayOfYear - monthDays[i - 1];
+        for(month = 1; month <= 12; month++){
+            if(monthDays[month] > dayOfYear){
+                dayOfMonth = dayOfYear - monthDays[month - 1] + 1;
+                dateTime += month * 100 + dayOfMonth;
                 break;
             }
         }
@@ -333,15 +346,19 @@ int parseOHLCV(char ohlcvCode){
             num += (fileLine[j] - '0') * (int)power(10, fileLineSpot1 - j + 1);
         }
     }
+    if (ohlcvCode == 'V') {
+        return num;
+    }
+    
     // get two digits after .
     if (fileLine[fileLineSpot1] == '.') {
         fileLineSpot1++;
         if(fileLineSpot1 < fileLineLength){
-            if (fileLine[fileLineSpot1] != ',') {
-                num += (fileLine[fileLineSpot1 - 1] - '0') * 10;
+            if (isNumeric(fileLine[fileLineSpot1])) {
+                num += (fileLine[fileLineSpot1] - '0') * 10;
                 fileLineSpot1++;
                 if(fileLineSpot1 < fileLineLength){
-                    if (fileLine[fileLineSpot1] != ',') {
+                    if (isNumeric(fileLine[fileLineSpot1])) {
                         num += (fileLine[fileLineSpot1] - '0');
                     }
                 }
@@ -446,150 +463,17 @@ void checkStoredTimes(){
             cerr << "storedMetrics[" << i << "] must be O/H/L/C/V.\n\n";
             exit(1);
         }
+
+        for(int j=0;j<numStoredTimes;j++){
+            if(i != j && storedTimes[i] == storedTimes[j]){
+                cerr << "Two stored times cannot hold the same time.\n\n";
+                exit(1);
+            }
+        }
     }
 }
 
-// scan a file, only sampling symbols and dates
-void scanFile(){
-    int numValuesPerLine = size(columnCodes);
-
-    ifstream f(fileAddress);
-
-    if (!f.is_open()) {
-        cerr << "File " << fileAddress << " was found but could not be opened.\n\n";
-        exit(1);
-    }
-
-    fileLine = "";
-
-    getline(f, fileLine);
-
-    fileLineIndex = -1;
-    while (getline(f, fileLine)) {
-        fileLineIndex++;
-        fileLineSpot = 0;
-        fileLineSpot1 = 0;
-        fileLineLength = fileLine.length();
-
-        if (fileLineLength < 20) {
-            cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " with a length of " << fileLineLength << "characters was incorrectly shorter than 20 characters long. Make sure it includes a date and time, OHLCV values, and a ticker symbol.\n\n";
-            exit(1);
-        }
-
-        int scannedDate = -1;
-        int scannedTime = -1;
-
-        for(int i=0;i<numValuesPerLine;i++){
-            fileLineSpot1 = fileLineSpot;
-
-            // get this value
-            switch(columnCodes[i]){
-                case 'S':{
-                    currentSymbol = parseSymbol();
-                    if (symbol_index.find(currentSymbol) != symbol_index.end()) {
-                        currentSymbolIndex = symbol_index.at(currentSymbol);
-                    }else{
-                        currentSymbolIndex = numSymbols;
-                        symbol_index[currentSymbol] = numSymbols;
-                        index_symbol[numSymbols] = currentSymbol;
-                        numSymbols++;
-                    }
-                    break;
-                }
-                case 'M':{
-                    // scan the moment
-                    currentDateTime = parseMoment();
-                    currentDate = currentDateTime / 10000;
-                    currentTime = currentDateTime % 10000;
-                    if (date_index.find(currentDate) != date_index.end()) {
-                        currentDateIndex = date_index.at(currentDate);
-                    }else{
-                        currentDateIndex = numDates;
-                        date_index[currentDate] = numDates;
-                        index_date[numDates] = currentDate;
-                        numDates++;
-                    }
-                    break;
-                }
-                case 'U':{
-                    // scan the unix timestamp
-                    currentDateTime = parseUnix();
-                    currentDate = currentDateTime / 10000;
-                    currentTime = currentDateTime % 10000;
-                    if (date_index.find(currentDate) != date_index.end()) {
-                        currentDateIndex = date_index.at(currentDate);
-                    }else{
-                        currentDateIndex = numDates;
-                        date_index[currentDate] = numDates;
-                        index_date[numDates] = currentDate;
-                        numDates++;
-                    }
-                    break;
-                }
-                case 'D':{
-                    // scan the date
-                    currentDate = parseDate();
-                    if (date_index.find(currentDate) != date_index.end()) {
-                        currentDateIndex = date_index.at(currentDate);
-                    }else{
-                        currentDateIndex = numDates;
-                        date_index[currentDate] = numDates;
-                        index_date[numDates] = currentDate;
-                        numDates++;
-                    }
-                    break;
-                }
-                case 'T':{
-                    // scan the time
-                    // nothing needed
-                    break;
-                }
-            }
-
-
-            // move past next comma
-            if(i < numValuesPerLine - 1){
-                while (fileLine[fileLineSpot] != ',') {
-                    fileLineSpot++;
-                    if (fileLineSpot >= fileLineLength) {
-                        cerr << "Bar " << fileLineIndex << " in file " << fileAddress << " ended without a comma after value " << i << ". According to the columnCodes you entered, there should be " << numValuesPerLine << " values and " << numValuesPerLine - 1 << " commas.\n\n";
-                        exit(1);
-                    }
-                }
-            }
-            fileLineSpot++;
-        }
-
-        
-    }
-
-    f.close();
-}
-
-void scanAllFiles(string path){
-
-    checkColumnCodes();
-
-    cout << "Scanning files in folder " << path << "... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
-    numFiles = size(filesToRead);
-    for (const auto& entry : fs::directory_iterator(path)){
-        fileAddress = entry.path().string();
-        if(numFiles > 0){
-            for(int i=0;i<numFiles;i++){
-                if(filesToRead[i] == fileAddress){
-                    scanFile();
-                    break;
-                }
-            }
-        }else{
-            scanFile();
-        }
-    }
-
-    cout << "Finished scanning " << numFiles << " files.\n\n";
-    
-}
-
+// read one file
 void readFile(){
     int numValuesPerLine = size(columnCodes);
 
@@ -600,8 +484,6 @@ void readFile(){
         exit(1);
     }
 
-    int previousTime = DUMMY_INT;
-
     fileLine = "";
 
     getline(f, fileLine);
@@ -618,7 +500,8 @@ void readFile(){
             exit(1);
         }
 
-        bool skip = 0;
+        // reset currentTimeIndex so that it can be used to break line or keep reading
+        currentTimeIndex = 0;
 
         // get every value in the line, then afterwards organize the values
         for(int i=0;i<numValuesPerLine;i++){
@@ -643,16 +526,6 @@ void readFile(){
                     currentDate = currentDateTime / 10000;
                     currentTime = currentDateTime % 10000;
                     currentTimeIndex = -1;
-                    for(int i=0;i<numStoredTimes;i++){
-                        if(storedTimes[i] == currentTime){
-                            currentTimeIndex = i;
-                            break;
-                        }
-                    }
-                    if(currentTimeIndex == -1){
-                        skip = 1;
-                        break;
-                    }
                     if (date_index.find(currentDate) != date_index.end()) {
                         currentDateIndex = date_index.at(currentDate);
                     }else{
@@ -661,10 +534,17 @@ void readFile(){
                         index_date[numDates] = currentDate;
                         numDates++;
                     }
+                    for(int i=0;i<numStoredTimes;i++){
+                        if(storedTimes[i] == currentTime){
+                            currentTimeIndex = i;
+                            break;
+                        }
+                    }
                     break;
                 }
                 case 'D':{
                     currentDate = parseDate();
+                    currentDateTime = currentDate * 10000 + currentTime;
                     if (date_index.find(currentDate) != date_index.end()) {
                         currentDateIndex = date_index.at(currentDate);
                     }else{
@@ -677,16 +557,13 @@ void readFile(){
                 }
                 case 'T':{
                     currentTime = parseTime();
+                    currentDateTime = currentDate * 10000 + currentTime;
                     currentTimeIndex = -1;
                     for(int i=0;i<numStoredTimes;i++){
                         if(storedTimes[i] == currentTime){
                             currentTimeIndex = i;
                             break;
                         }
-                    }
-                    if(currentTimeIndex == -1){
-                        skip = 1;
-                        break;
                     }
                     break;
                 }
@@ -715,16 +592,6 @@ void readFile(){
                     currentDate = currentDateTime / 10000;
                     currentTime = currentDateTime % 10000;
                     currentTimeIndex = -1;
-                    for(int i=0;i<numStoredTimes;i++){
-                        if(storedTimes[i] == currentTime){
-                            currentTimeIndex = i;
-                            break;
-                        }
-                    }
-                    if(currentTimeIndex == -1){
-                        skip = 1;
-                        break;
-                    }
                     if (date_index.find(currentDate) != date_index.end()) {
                         currentDateIndex = date_index.at(currentDate);
                     }else{
@@ -733,13 +600,14 @@ void readFile(){
                         index_date[numDates] = currentDate;
                         numDates++;
                     }
+                    for(int i=0;i<numStoredTimes;i++){
+                        if(storedTimes[i] == currentTime){
+                            currentTimeIndex = i;
+                            break;
+                        }
+                    }
                     break;
                 }
-            }
-
-            // exit line to skip it because this bar's time is not one of the storedTimes
-            if(skip){
-                break;
             }
 
             // move to next comma if there is a next comma
@@ -756,10 +624,23 @@ void readFile(){
             fileLineSpot++;
         }
 
-        // handle dates that are out of order (must be non-decreasing across bars, including bars from different files)
-        if (currentDateIndex > 0) {
-            if (index_date.at(currentDateIndex - 1) > index_date.at(currentDateIndex)) {
-                cerr << "Consecutively parsed dates " << dateToString(index_date.at(currentDateIndex - 1)) << " and " << dateToString(index_date.at(currentDateIndex)) << " were not entered in ascending order. This was because the file was not scanned correctly before reading.\n\n";
+        // update the map of symbols on this day if a new symbol is found
+        int currentSymbolIndexDay = 0;
+        if (symbol_index_day[currentDateIndex].find(currentSymbol) != symbol_index_day[currentDateIndex].end()) {
+            currentSymbolIndexDay = symbol_index.at(currentSymbol);
+        }else{
+            currentSymbolIndexDay = numBarsByDateIndex[currentDateIndex];
+            symbol_index_day[currentDateIndex][currentSymbol] = currentSymbolIndexDay;
+            index_symbol_day[currentDateIndex][currentSymbolIndexDay] = currentSymbol;
+            numBarsByDateIndex[currentDateIndex]++;
+        }
+
+        // if this isn't the first bar recorded of this symbol EVER (if it is, ascend/descend does not matter as there is no previous datetime to compare to)
+        if(numBars[currentSymbolIndex] > 0){
+
+            // handle out of ascending order exception
+            if (currentDateTime <= lastDateTime[currentSymbolIndex]) {
+                cerr << "Consecutively parsed bars " << lastDateTime[currentSymbolIndex] << " and " << currentDateTime << " of symbol " << index_symbol.at(currentSymbolIndex) << " were not recorded in ascending order as previous bars of this symbol and/or other symbols were.\n\n";
                 exit(1);
             }
         }
@@ -770,76 +651,83 @@ void readFile(){
         //    cout << currentSymbol << " " << currentDateTime << " " << currentDateIndex << " " << currentTimeIndex << "\n";
         //}
 
-        // determine if this bar is the first one past any number of times stored
-        for(int i=0;i<numStoredTimes;i++){
-            if(currentTime > storedTimes[i] && previousTime <= storedTimes[i] && previousTime != DUMMY_INT && priceSweeper[currentSymbolIndex] != DUMMY_INT){
-                // if ascended past, get the ohlcv value as the price sweeper value (last close recorded)
-                int a = i + (currentDateIndex + currentSymbolIndex * maxNumDates) * numStoredTimes;
-                p[a] = priceSweeper[currentSymbolIndex];
-                index_symbol_day[currentDateIndex][numPointsByDateIndex[currentDateIndex]] = currentSymbol;
-                symbol_index_day[currentDateIndex][currentSymbol] = numPointsByDateIndex[currentDateIndex];
-                numPointsByDateIndex[currentDateIndex]++;
+        // update the total volume with this bar's volume
+        totalVolume[currentSymbolIndex][currentDateIndex] += currentOHLCV[4];
+            
+        int indexGeneral = (currentDateIndex + currentSymbolIndexDay * maxNumDates) * numStoredTimes;
 
-                cout << index_symbol.at(currentSymbolIndex) << " " << currentTime << " " << previousTime << " " << storedTimes[i] << " " << numPointsByDateIndex[currentDateIndex] << " " << i << " " << p[a];
-            }
-            if(currentTime < storedTimes[i] && previousTime >= storedTimes[i] && previousTime != DUMMY_INT && priceSweeper[currentSymbolIndex] != DUMMY_INT){
-                // if descended past, get the ohlcv value as the price sweeper value (last close recorded)
-                int a = i + (currentDateIndex + currentSymbolIndex * maxNumDates) * numStoredTimes;
-                p[a] = priceSweeper[currentSymbolIndex];
-                numPointsByDateIndex[currentDateIndex]++;
+        // if this isn't the first bar recorded for this symbol IN THIS FILE (if it is, no data gets recorded)
+        if(lastDateTime[currentSymbolIndex] != DUMMY_INT){
+            
+            // determine if this bar is the first one past any of the times stored
+            for(int i=0;i<numStoredTimes;i++){
+
+                if(currentTime > storedTimes[i] && lastDateTime[currentSymbolIndex] <= storedTimes[i] && priceSweeper[currentSymbolIndex] != DUMMY_INT){
+                    // if ascended past, store the ohlcv value as the price sweeper value (last close recorded)
+                    p[indexGeneral + i] = priceSweeper[currentSymbolIndex];
+                }
             }
         }
 
-        // update the previous time
-        previousTime = currentTime;
+        // update the previous datetime recorded for this symbol
+        lastDateTime[currentSymbolIndex] = currentDateTime;
 
         // update the price sweeper for this symbol with the last close recorded
         priceSweeper[currentSymbolIndex] = currentOHLCV[3];
 
-        // skip line if not one of the stored times
-        if(skip){
-            continue;
-        }
+        // if one of the stored times
+        if(currentTimeIndex > -1){
 
-        // get the ohlcv value depending on the storedMetric
-        int a = currentTimeIndex + (currentDateIndex + currentSymbolIndex * maxNumDates) * numStoredTimes;
-        switch(storedMetrics[currentTimeIndex]){
-            case 'O':
-                p[a] = currentOHLCV[0];
-                break;
-            case 'H':
-                p[a] = currentOHLCV[1];
-                break;
-            case 'L':
-                p[a] = currentOHLCV[2];
-                break;
-            case 'C':
-                p[a] = currentOHLCV[3];
-                break;
-            case 'V':
-                p[a] = currentOHLCV[4];
-                totalVolume[currentSymbolIndex][currentDateIndex] += currentOHLCV[4];
-                break;
+            int trueIndex = indexGeneral + currentTimeIndex;
+
+            // store the ohlcv value depending on the storedMetric and which stored time this bar is on
+            switch(storedMetrics[currentTimeIndex]){
+                case 'O':
+                    p[trueIndex] = currentOHLCV[0];
+                    break;
+                case 'H':
+                    p[trueIndex] = currentOHLCV[1];
+                    break;
+                case 'L':
+                    p[trueIndex] = currentOHLCV[2];
+                    break;
+                case 'C':
+                    p[trueIndex] = currentOHLCV[3];
+                    break;
+                case 'V':
+                    p[trueIndex] = currentOHLCV[4];
+                    break;
+            }
         }
-        numPointsByDateIndex[currentDateIndex]++;
         
+        numBarsTotal++;
+        numBars[currentSymbolIndex]++;
     }
 
     f.close();
 }
 
 // read every file in the folder given by this address
-void readAllFiles(string path) {
+void readAllFiles(string path, int printLoadingEveryNFiles, bool printLoading) {
 
     checkColumnCodes();
 
     checkStoredTimes();
 
     cout << "Reading files in folder " << path << "... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
+    numFiles = 0;
     numFiles = size(filesToRead);
+    int numFilesComplete = 0, numFilesTotal = 0;
+    bool readCustomFiles = numFiles > 0;
+    for (const auto& entry : fs::directory_iterator(path)){
+        if(!readCustomFiles){
+            numFiles++;
+        }
+        numFilesTotal++;
+    }
     for (const auto& entry : fs::directory_iterator(path)){
         fileAddress = entry.path().string();
-        if(numFiles > 0){
+        if(readCustomFiles){
             for(int i=0;i<numFiles;i++){
                 if(filesToRead[i] == fileAddress){
                     readFile();
@@ -849,13 +737,18 @@ void readAllFiles(string path) {
         }else{
             readFile();
         }
+        numFilesComplete++;
+        if(numFilesComplete % printLoadingEveryNFiles == 0 && printLoading){
+            cout << numFilesComplete << "/" << numFiles << " files complete.\n";
+        }
     }
 
-    cout << "Finished reading " << numFiles << " files.\n\n";
+    cout << "Finished reading " << numFilesComplete << "/" << numFiles << " files of " << numFilesTotal << " files in this folder.\n\n";
 }
 
 // setup the data storage
 void setup() {
+
     cout << "Setting up the program... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
     int i = 0, j = 0;
 
@@ -867,11 +760,15 @@ void setup() {
     numSymbols = 0;
     numAllowedTickers = 0;
     for(int i=0;i<maxNumDates;i++){
-        numPointsByDateIndex[i] = 0;
+        numBarsByDateIndex[i] = 0;
+        numFilledByDateIndex[i] = 0;
     }
 
     for (i = 0; i < maxNumSymbols; i++) {
+        numBars[i] = 0;
         priceSweeper[i] = DUMMY_INT;
+        lastDateTime[i] = DUMMY_INT;
+
         for (j = 0; j < maxNumDates; j++) {
 
             totalVolume[i][j] = 0;
@@ -883,19 +780,25 @@ void setup() {
     }
 }
 
-void setupDateData() {
+void setupDateData(int numVolumeDays, int minVolume, int maxVolume, bool includePartialVolumeSamples) {
     cout << "Setting up the date data storage... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
     int i = 0, j = 0, k = 0, l = 0;
 
     entries = (double**)calloc(numDates, sizeof(double*));
     exits = (double**)calloc(numDates, sizeof(double*));
 
+    long long totalPoints = 0;
+    long long filteredPoints = 0;
+
     // categorize all data points from p[] by date (group into dates)
     for (i = 0; i < numDates; i++) {
-        int numPoints = numPointsByDateIndex[i];
+        numFilledByDateIndex[i] = 0;
+
+        // use the total number of symbols on this date because it is >= the number of symbols completely filled
+        int numPoints = numBarsByDateIndex[i];
 
         if(numPoints > maxNumSymbols){
-            cerr << "Number of data points on day " << i << " was greater than the maximum number of symbols allowed for any given date, " << maxNumSymbols << ". Increase maxNumSymbols.\n\n";
+            cerr << "The number of data points on day " << i << ", " << numPoints << ", was greater than the maximum number of symbols allowed for any given date, " << maxNumSymbols << ". Increase maxNumSymbols.\n\n";
             exit(1);
         }
 
@@ -904,30 +807,73 @@ void setupDateData() {
 
         for (j = 0; j < numPoints; j++) {
 
+            totalPoints++;
+
             // if all points (for different storedTimes) within this symbol and date are in the dataset (!= DUMMY_INT), store the entry and exit for this symbol and day within a temp array and increment # symbols on this day
             bool allPointsTodayFound = 1;
-            // location of the point of this date and symbol (first time) within p[]
+            // location of the point of this date and symbol (first time during day) within p[]
             int index = (i + j * maxNumDates) * numStoredTimes;
+            
             for (k = 0; k < numStoredTimes; k++) {
                 if (p[index + k] == DUMMY_INT) {
                     allPointsTodayFound = 0;
                 }
             }
-            if (allPointsTodayFound) {
-                // get the index of the symbol traded at this date and symbol
-                
-                // calculation of entries and exits (depends on strategy)
-                entriesDay[j] = (100.0 * (double)(p[index + 1] - p[index + 0]) / (double)p[index + 0]);
-                exitsDay[j] = (100.0 * (double)(p[index + 2] - p[index + 1]) / (double)p[index + 1]);
-                if(i == 0 && j < 10){
-                    cout << j << " " << index_symbol.at(j) << " " << p[index] << " " << p[index+1] << " " << p[index+2] << "\n";
+            if (!allPointsTodayFound) continue;
+            
+            bool volumeFilter = 1;
+            long long vol = 0;
+            if(includePartialVolumeSamples || i >= numVolumeDays - 1){
+                // only add up previous days' volumes for this symbol if allowed to include volume samples for some but not all of numVolumeDays past days or if i >= numVolumeDays - 1
+                int ind = symbol_index.at(index_symbol_day[i].at(j));
+                for(k=0;k<numVolumeDays;k++){
+                    if(i-k>=0){
+                        vol += totalVolume[ind][i-k];
+                    }
                 }
             }
+            if(vol < minVolume || vol > maxVolume) continue;
+
+            filteredPoints++;
+
+            for (k = 0; k < numStoredTimes; k++) {
+                if (p[index + k] < 0) {
+                    cerr << "Exits[" << i << "][" << numFilledByDateIndex[i] << "] was empty. This must have been because a data value from symbol " << j << " on date " << index_date.at(i) << " was negative.\n\n";
+                    exit(1);
+                }
+            }
+                
+            // calculation of entries and exits (depends on strategy)
+            if(p[index + 0] == 0){
+                entriesDay[numFilledByDateIndex[i]] = 0.0;
+            }else{
+                entriesDay[numFilledByDateIndex[i]] = (double)(p[index + 1] - p[index + 0]) / (double)p[index + 0];
+            }
+                
+            if(p[index + 1] == 0){
+                exitsDay[numFilledByDateIndex[i]] = 0.0;
+            }else{
+                exitsDay[numFilledByDateIndex[i]] = (double)(p[index + 2] - p[index + 1]) / (double)p[index + 1];
+            }
+            
+            index_symbol_sorted[i][numFilledByDateIndex[i]] = index_symbol_day[i].at(j);
+            symbol_index_sorted[i][index_symbol_day[i].at(j)] = numFilledByDateIndex[i];
+                
+            // increment the number of fully-filled symbols on this day
+            numFilledByDateIndex[i]++;
         }
 
         entries[i] = entriesDay;
         exits[i] = exitsDay;
     }
+    
+    cout << "Filtered " << totalPoints << " data points from " << numDates << " dates down to " << filteredPoints << " data points.\n\n";
+}
+
+void sortDateData(bool ascending){
+    cout << "Sorting the date data... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
+    int i = 0, j = 0, k = 0, l = 0;
+    bool swap = 0;
 
     // sort the data within every day of points[]
     double temp = 0.0;
@@ -940,19 +886,11 @@ void setupDateData() {
     double minVal = (double)INT_MAX;
     for (i = 0; i < numDates; i++) {
 
-        int numPoints = numPointsByDateIndex[i];
+        int numPoints = numFilledByDateIndex[i];
         if (numPoints == 0) continue;
+        
         // get the range of values to initialize the buckets
         for (j = 0; j < numPoints; j++) {
-            // if any entries are empty, exit
-            if(entries[i][j] == DUMMY_DOUBLE){
-                cerr << "Entries[" << i << "][" << j << "] was empty.\n\n";
-                exit(1);
-            }
-            if(exits[i][j] == DUMMY_DOUBLE){
-                cerr << "Exits[" << i << "][" << j << "] was empty.\n\n";
-                exit(1);
-            }
 
             if (entries[i][j] < minVal) minVal = entries[i][j];
             if (entries[i][j] > maxVal) maxVal = entries[i][j] * 1.0001;
@@ -969,17 +907,19 @@ void setupDateData() {
         int index = 0;
         // fill the buckets with the values to be sorted
         for (j = 0; j < numPoints; j++) {
+
             index = (int)((double)numBuckets * (entries[i][j] - minVal) / range);
             bucketsEntries[index].push_back(entries[i][j]);
             bucketsExits[index].push_back(exits[i][j]);
-            bucketsSymbols[index].push_back(index_symbol_day[i][j]);
+            bucketsSymbols[index].push_back(index_symbol_sorted[i][j]);
         }
         // iterate over the buckets
         for (j = 0; j < numBuckets; j++) {
             // sort them using exchange sort
             for (k = 0; k < size(bucketsEntries[j]); k++) {
                 for (l = k + 1; l < size(bucketsEntries[j]); l++) {
-                    if (bucketsEntries[j][k] < bucketsEntries[j][l]) {
+                    swap = ascending && bucketsEntries[j][k] > bucketsEntries[j][l] || !ascending && bucketsEntries[j][k] < bucketsEntries[j][l];
+                    if (swap) {
                         temp = bucketsEntries[j][k];
                         bucketsEntries[j][k] = bucketsEntries[j][l];
                         bucketsEntries[j][l] = temp;
@@ -991,6 +931,7 @@ void setupDateData() {
                         temps = bucketsSymbols[j][k];
                         bucketsSymbols[j][k] = bucketsSymbols[j][l];
                         bucketsSymbols[j][l] = temps;
+
                     }
                 }
             }
@@ -1002,7 +943,7 @@ void setupDateData() {
             for (k = 0; k < size(bucketsEntries[j]); k++) {
                 entries[i][index] = bucketsEntries[j][k];
                 exits[i][index] = bucketsExits[j][k];
-                index_symbol_day[i][index] = bucketsSymbols[j][k];
+                index_symbol_sorted[i][index] = bucketsSymbols[j][k];
                 index++;
             }
         }
@@ -1010,10 +951,15 @@ void setupDateData() {
             cerr << "Some data was unexpectedly lost while sorting values within a given date. Number of bucket values was " << index << " and number of points for this date was " << numPoints << ".\n\n";
             exit(1);
         }
+
+        // assign symbols to indices since we have only sorted indices to symbols on this day
+        for(j=0;j<numPoints;j++){
+            symbol_index_day[i][index_symbol_sorted[i][j]] = j;
+        }
     }
 }
 
-void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, long long minPreviousVolume, long long maxPreviousVolume, int previousVolumeLookBackLength, double leverage, bool disregardFilters) {
+void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, long long minPreviousVolume, long long maxPreviousVolume, int previousVolumeLookBackLength, double leverage, bool disregardFilters, double minOutlier, double maxOutlier, bool printOutliers, bool ignoreOutliers, bool printAllResults, bool printDetailedResults) {
     cout << "Backtesting with " << numAllowedTickers << " symbols allowed to trade... (This may take a few seconds to minutes depending on the amount of data present.)\n\n";
 
     if(numDates < 1){
@@ -1033,16 +979,24 @@ void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, 
     if (endingDateIndex < 0) endingDateIndex = 0;
     if (endingDateIndex >= numDates) endingDateIndex = numDates - 1;
 
-    int wins = 0, losses = 0, ties = 0, trades = 0;
-    double won = 0.0, lost = 0.0, total = 0.0;
-    double balance = 1.0;
-
     int tradeSymbolIndexByDate = 0;
     long long previousVolume = 0;
 
-    for (int dateIndex = startingDateIndex; dateIndex <= endingDateIndex; dateIndex++) {
+    string tradeSymbol = "";
 
-        // if (numSymbolsPerDay > numPointsByDateIndex[dateIndex]) continue;
+    int numOutliers = 0;
+
+    // outcome stats with respect to # of symbols traded each day
+    vector<int> wins(numSymbolsPerDay, 0);
+    vector<int> losses(numSymbolsPerDay, 0);
+    vector<int> ties(numSymbolsPerDay, 0);
+    vector<double> won(numSymbolsPerDay, 0);
+    vector<double> lost(numSymbolsPerDay, 0);
+    vector<double> balance(numSymbolsPerDay, 1.0);
+    vector<double> avSquaredDeviation(numSymbolsPerDay, 1.0);
+    vector<double> sd(numSymbolsPerDay, 1.0);
+
+    for (int dateIndex = startingDateIndex; dateIndex <= endingDateIndex; dateIndex++) {
 
         tradeSymbolIndexByDate = -1;
 
@@ -1052,12 +1006,12 @@ void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, 
             bool flag = 1;
             while (flag) {
                 tradeSymbolIndexByDate++;
-                if (tradeSymbolIndexByDate >= numPointsByDateIndex[dateIndex]){
+                if (tradeSymbolIndexByDate >= numFilledByDateIndex[dateIndex]){
                     break;
                 }
 
                 previousVolume = 0;
-                string tradeSymbol = index_symbol_day[dateIndex].at(tradeSymbolIndexByDate);
+                tradeSymbol = index_symbol_sorted[dateIndex].at(tradeSymbolIndexByDate);
                 int tradeSymbolIndex = symbol_index.at(tradeSymbol);
 
                 // add up all previous day volumes if previous days existed
@@ -1096,36 +1050,127 @@ void backtest(int startingDateIndex, int endingDateIndex, int numSymbolsPerDay, 
                     }
                 }
             }
+        
+            // finish quitting for this day if all symbols have been checked
+            if (tradeSymbolIndexByDate >= numFilledByDateIndex[dateIndex]) break;
 
-            if (tradeSymbolIndexByDate >= numPointsByDateIndex[dateIndex]) break;;
+            // actual criteria for entering trade (optional, since already choosing stocks based on entries[] and optional daily volume)
+            //
 
             // trade this symbol
             double result = exits[dateIndex][tradeSymbolIndexByDate];
-            cout << result << " " << dateIndex << " " << tradeSymbolIndexByDate << "\n";
+            if(printAllResults && !printDetailedResults){
+                cout << result << " ";
+            }
+            if(printDetailedResults){
+                cout << result << " " << tradeSymbol << " " << index_date.at(dateIndex) << "\n";
+            }
+            if(result <= minOutlier || result >= maxOutlier){
+                numOutliers++;
+                if(printOutliers){
+                    cout << result << " " << tradeSymbol << " " << index_date.at(dateIndex) << "\n";
+                }
+                if(ignoreOutliers){
+                    result = 0.0;
+                }
+            }
             if (result > 0.0) {
-                wins++;
-                won += result;
+                for(int j=i;j<numSymbolsPerDay;j++){
+                    wins[j]++;
+                    won[j] += result;
+                }
             }
             else {
                 if (result < 0.0) {
-                    losses++;
-                    lost -= result;
+                    for(int j=i;j<numSymbolsPerDay;j++){
+                        losses[j]++;
+                        lost[j] += result;
+                    }
                 }
                 else {
-                    ties++;
+                    for(int j=i;j<numSymbolsPerDay;j++){
+                        ties[j]++;
+                    }
                 }
             }
 
             // update account balance stats
-            total += result;
-            trades++;
-            balance *= (100.0 + result) / 100.0;
+            for(int j=i;j<numSymbolsPerDay;j++){
+                avSquaredDeviation[j] += result * result;
+                balance[j] *= (1.0 + result);
+            }
         }
     }
-    
-    cout << "ANALYSIS:\n\nTrades: " << trades << "\nWins: " << wins << "\nLosses: " << losses << "\nTies: " << ties;
-    cout << "\nTotal Percentage Gained: " << total << "%\nPercentage Won: " << won << "%\nPercentage Lost: " << lost << "%\nProfit Factor: " << won / lost << "\nFinal Balance: " << balance << "\n\n\n";
 
+    string output = "";
+
+    output += "Backtested from date with index " + to_string(startingDateIndex) + " to index " + to_string(endingDateIndex) + ", " + to_string(endingDateIndex - startingDateIndex + 1) + " days.\n\n";
+    
+    output += "ANALYSIS:\n\nTrades: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string(wins[j] + losses[j] + ties[j]) + "   ";
+    }
+    
+    output += "\nWins: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string(wins[j]) + "   ";
+    }
+    
+    output += "\nLosses: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string(losses[j]) + "   ";
+    }
+    
+    output += "\nTies: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string(ties[j]) + "   ";
+    }
+
+    output += "\nPercentage Won: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string(won[j] * 100.0) + "   ";
+    }
+
+    output += "\nPercentage Lost: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string(lost[j] * 100.0) + "   ";
+    }
+
+    output += "\nTotal Percentage Gained: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string((won[j] + lost[j]) * 100.0) + "   ";
+    }
+
+    output += "\nProfit Factor: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string(-1.0 * won[j] / lost[j]) + "   ";
+    }
+
+    output += "\nFinal Balance: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string(balance[j]) + "   ";
+    }
+
+    output += "\nVariance of Trade Results From Zero: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        avSquaredDeviation[j] /= (double)(wins[j] + losses[j]);
+        output += to_string(avSquaredDeviation[j]) + "   ";
+    }
+
+    output += "\nStandard Deviation of Trade Results From Zero: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        sd[j] = sqrt(avSquaredDeviation[j]);
+        output += to_string(sd[j]) + "   ";
+    }
+
+    output += "\nSharpe Ratio: ";
+    for(int j=0;j<numSymbolsPerDay;j++){
+        output += to_string((won[j] + lost[j]) / sd[j]) + "   ";
+    }
+
+    output += "\n\nThere were " + to_string(numOutliers) + " outlying trade results.\n\n";
+
+    cout << output;
 }
 
 // find start of first occurrence of word in s
@@ -1392,17 +1437,18 @@ int main() {
 
     string readPath = "C:\\Minute Stock Data\\";
     columnCodes = "SVOCHLU-";
-    filesToRead = {"C:\\Minute Stock Data\\2020-05-15.csv"};
-    readAllFiles(readPath);
+    // filesToRead = {"C:\\Minute Stock Data\\2025-05-12.csv"};
+    readAllFiles(readPath, 5, true);
 
-    setupDateData();
+    setupDateData(10, 1000000, INT_MAX, 1);
+    sortDateData(true);
 
     vector<string> banned = { "" };
-    extractSymbolData("C:\\Stock Symbols\\symbolDataNASDAQ.txt", "symbol:", "volume:", "marketCap:", 1, 0, -6);
-    filterSymbols(0, LLONG_MAX, 0, LLONG_MAX, banned);
+    //extractSymbolData("C:\\Stock Symbols\\symbolDataNASDAQ.txt", "symbol:", "volume:", "marketCap:", 1, 0, -6);
+    //filterSymbols(0, LLONG_MAX, 0, LLONG_MAX, banned);
     //printAllowedSymbols(false);
-    ////    Comment out either the above line or the line below this to use
-    backtest(0, -1, 10, 0, INT_MAX, 1, 0.1, true);
+    ////    Comment out either the above three lines or the line below this to use
+    backtest(0, -1, 1, 0, INT_MAX, 1, 0.1, true, -0.5, 0.5, true, true, true, true);
     
     return 0;
 }
