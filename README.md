@@ -22,4 +22,8 @@ Change columnCodes according to the format of each line in every file. This shou
 - C = close
 - Dash = unused value
 
-You can also input data as a text file and extract filtered ticker symbols along with volume and market cap data. Changing the file address in the call to extractSymbolData() within main() lets you do this. This h3lps with organizing hundreds or thousands of symbols.
+You can also input data as a text file and extract filtered ticker symbols along with volume and market cap data. Changing the file address in the call to extractSymbolData() within main() lets you do this. This helps with organizing hundreds or thousands of symbols.
+
+The program has two modes: daywise and minutewise backtesting.
+Daywise enters and exits trades at specified times of the day (according to storedTimes and storedMetrics) on a predefined number of assets with the greatest change (by default, but this can be changed) between the first two storedTimes.
+Minutewise enters and exits trades based on specified entry and exit conditions at any time of day.
