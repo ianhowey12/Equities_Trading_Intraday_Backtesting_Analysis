@@ -12,7 +12,6 @@ namespace fs = std::filesystem;
 
 vector<char> symbolData;
 
-
 int numFiles = 0;
 
 // data used to read CSV files
@@ -30,9 +29,6 @@ int fileLineSpot1 = 0;
 #define DUMMY_DOUBLE (double)INT_MIN
 
 
-
-
-
 // times whose bars should be stored and used to backtest
 vector<int> storedTimes = { 930, 935, 1500 };
 // metrics (OHLCV) of the bars that should be stored and used to backtest
@@ -48,13 +44,13 @@ bool daywiseBacktesting = 0;
 #define numStoredTimes 3
 
 // maximum number of previous minutes being recorded (only need as much as strategy requires)
-#define maxNumMinutes 20
+#define maxNumMinutes 60 // 1440 = 24h is always enough, but 60 is usually enough and ensures quick full filling of arrays
 
-double previousMinutesO[maxNumSymbols][maxNumMinutes];
-double previousMinutesH[maxNumSymbols][maxNumMinutes];
-double previousMinutesL[maxNumSymbols][maxNumMinutes];
-double previousMinutesC[maxNumSymbols][maxNumMinutes];
-double previousMinutesV[maxNumSymbols][maxNumMinutes];
+double open[maxNumSymbols][maxNumMinutes];
+double high[maxNumSymbols][maxNumMinutes];
+double low[maxNumSymbols][maxNumMinutes];
+double close[maxNumSymbols][maxNumMinutes];
+double volume[maxNumSymbols][maxNumMinutes];
 
 double entryPriceThisMinute[maxNumSymbols];
 long long entryDateTime[maxNumSymbols];
@@ -105,6 +101,7 @@ double** exits;
 // values that sweep across all dates, filling in holes in price with last price value recorded for that symbol
 double priceSweeper[maxNumSymbols];
 long long lastDateTime[maxNumSymbols];
+int earliestTimeDay[maxNumSymbols];
 
 // cumulative volume for each symbol and date
 long long totalVolume[maxNumSymbols][maxNumDates];
@@ -132,12 +129,14 @@ double btLeverage = 0.0;
 bool btDisregardFilters = false;
 double btMinOutlier = 0.0;
 double btMaxOutlier = 0.0;
-bool btPrintOutliers = true;
 bool btIgnoreOutliers = true;
+bool btPrintOutliers = true;
 bool btPrintEntries = true;
 bool btPrintAllResults = true;
 bool btPrintDetailedResults = true;
-
+bool btPrintLoading = true;
+int btPrintLoadingInterval = 1;
+int btLoadingBarWidth = 60;
 
 // outcome stats with respect to # of symbols traded each day
 double btResult = 0.0;
@@ -673,6 +672,22 @@ void readFile(bool daywiseBacktesting){
             fileLineSpot++;
         }
 
+        // if this isn't the first bar recorded of this symbol EVER (if it is, ascend/descend does not matter as there is no previous datetime to compare to)
+        if(numBars[currentSymbolIndex] > 0){
+
+            // handle out of ascending order exception
+            if (currentDateTime <= lastDateTime[currentSymbolIndex]) {
+                cerr << "Consecutively parsed bars " << lastDateTime[currentSymbolIndex] << " and " << currentDateTime << " of symbol " << index_symbol.at(currentSymbolIndex) << " were not recorded in ascending order as previous bars of this symbol and/or other symbols were.\n\n";
+                exit(1);
+            }
+        }
+
+        // update the earliest recorded time today
+        int minutesSinceOpen = ((currentTime % 100) - 30) + ((currentTime / 100) - 9) * 60;
+        if(currentDateTime / 10000 > lastDateTime[currentSymbolIndex] / 10000){
+            earliestTimeDay[currentSymbolIndex] = currentTime;
+        }
+
         // update the map of symbols on this day if a new symbol is found
         int currentSymbolIndexDay = 0;
         if (symbol_index_day[currentDateIndex].find(currentSymbol) != symbol_index_day[currentDateIndex].end()) {
@@ -682,16 +697,6 @@ void readFile(bool daywiseBacktesting){
             symbol_index_day[currentDateIndex][currentSymbol] = currentSymbolIndexDay;
             index_symbol_day[currentDateIndex][currentSymbolIndexDay] = currentSymbol;
             numBarsByDateIndex[currentDateIndex]++;
-        }
-
-        // if this isn't the first bar recorded of this symbol EVER (if it is, ascend/descend does not matter as there is no previous datetime to compare to)
-        if(numBars[currentSymbolIndex] > 0){
-
-            // handle out of ascending order exception
-            if (currentDateTime <= lastDateTime[currentSymbolIndex]) {
-                cerr << "Consecutively parsed bars " << lastDateTime[currentSymbolIndex] << " and " << currentDateTime << " of symbol " << index_symbol.at(currentSymbolIndex) << " were not recorded in ascending order as previous bars of this symbol and/or other symbols were.\n\n";
-                exit(1);
-            }
         }
 
         // update the total volume with this bar's volume
@@ -778,34 +783,36 @@ void readFile(bool daywiseBacktesting){
                 int timeDifferenceFromLastBar = currentDateTime - lastDateTime[currentSymbolIndex];
                 timeDifferenceFromLastBar = min(timeDifferenceFromLastBar, maxNumMinutes);
                 // move the previous N bars down by the difference (minutes) from the last recorded bar
-                for(int i=maxNumMinutes-1;i>=0;i--){
+                for(int i=maxNumMinutes-1;i>0;i--){
                     int j = i - timeDifferenceFromLastBar;
                     if(j >= 0){
-                        previousMinutesO[currentSymbolIndex][i] = previousMinutesO[currentSymbolIndex][j];
-                        previousMinutesH[currentSymbolIndex][i] = previousMinutesH[currentSymbolIndex][j];
-                        previousMinutesL[currentSymbolIndex][i] = previousMinutesL[currentSymbolIndex][j];
-                        previousMinutesC[currentSymbolIndex][i] = previousMinutesC[currentSymbolIndex][j];
-                        previousMinutesV[currentSymbolIndex][i] = previousMinutesV[currentSymbolIndex][j];
-                    }else{
-                        previousMinutesO[currentSymbolIndex][i] = previousMinutesO[currentSymbolIndex][0];
-                        previousMinutesH[currentSymbolIndex][i] = previousMinutesH[currentSymbolIndex][0];
-                        previousMinutesL[currentSymbolIndex][i] = previousMinutesL[currentSymbolIndex][0];
-                        previousMinutesC[currentSymbolIndex][i] = previousMinutesC[currentSymbolIndex][0];
-                        previousMinutesV[currentSymbolIndex][i] = previousMinutesV[currentSymbolIndex][0];
+                        open[currentSymbolIndex][i] = open[currentSymbolIndex][j];
+                        high[currentSymbolIndex][i] = high[currentSymbolIndex][j];
+                        low[currentSymbolIndex][i] = low[currentSymbolIndex][j];
+                        close[currentSymbolIndex][i] = close[currentSymbolIndex][j];
+                        volume[currentSymbolIndex][i] = volume[currentSymbolIndex][j];
+                    }else{ // fill recent bars with the last recorded bar values
+                        open[currentSymbolIndex][i] = open[currentSymbolIndex][0];
+                        high[currentSymbolIndex][i] = high[currentSymbolIndex][0];
+                        low[currentSymbolIndex][i] = low[currentSymbolIndex][0];
+                        close[currentSymbolIndex][i] = close[currentSymbolIndex][0];
+                        volume[currentSymbolIndex][i] = volume[currentSymbolIndex][0];
                     }
                 }
                 
             }
-            // fill the last minute with the current values
-            previousMinutesO[currentSymbolIndex][0] = currentOHLCV[0];
-            previousMinutesH[currentSymbolIndex][0] = currentOHLCV[1];
-            previousMinutesL[currentSymbolIndex][0] = currentOHLCV[2];
-            previousMinutesC[currentSymbolIndex][0] = currentOHLCV[3];
-            previousMinutesV[currentSymbolIndex][0] = currentOHLCV[4];
+            // fill the last bar with the current values
+            open[currentSymbolIndex][0] = currentOHLCV[0];
+            high[currentSymbolIndex][0] = currentOHLCV[1];
+            low[currentSymbolIndex][0] = currentOHLCV[2];
+            close[currentSymbolIndex][0] = currentOHLCV[3];
+            volume[currentSymbolIndex][0] = currentOHLCV[4];
+
+            int minutesSinceEntry = (currentDateTime % 100) - (entryDateTime[currentSymbolIndex] % 100) + ((currentDateTime / 100) - (entryDateTime[currentSymbolIndex] / 100)) * 60;
 
             // exit a trade at this minute if currently in a trade and exit condition succeeds (varies based on strategy)
             // NOTE: we can only exit on a listed bar. so if exits are time-based rather than price-based, they may be unideal and even biased
-bool exit = (currentDateTime / 10000) - (entryDateTime[currentSymbolIndex] / 10000) >= 1;
+bool exit = minutesSinceEntry >= 30;
 exit &= entryDateTime[currentSymbolIndex] != DUMMY_INT && entryPriceThisMinute[currentSymbolIndex] != DUMMY_DOUBLE;
             if(exit){
 
@@ -813,16 +820,16 @@ exit &= entryDateTime[currentSymbolIndex] != DUMMY_INT && entryPriceThisMinute[c
                 double exitPrice = currentOHLCV[3];
 
                 btResult = (exitPrice - entryPrice) / entryPrice;
-                if(btPrintAllResults && !btPrintDetailedResults){
+                if(btPrintAllResults && !btPrintDetailedResults && !btPrintLoading){
                     cout << btResult << " ";
                 }
-                if(btPrintDetailedResults){
-                    cout << "Exit: " << btResult << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << currentTime << "\n";
+                if(btPrintDetailedResults && !btPrintLoading){
+                    cout << "Exit: " << btResult << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << entryDateTime[currentSymbolIndex] % 10000 << "-" << currentTime << "\n";
                 }
                 if(btResult <= btMinOutlier || btResult >= btMaxOutlier){
                     btNumOutliers++;
-                    if(btPrintOutliers){
-                        cout << btResult << " " << currentSymbol << " " << index_date.at(currentDateIndex) << "\n";
+                    if(btPrintOutliers && !btPrintLoading){
+                        cout << "Outlier: " << btResult << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << currentTime << "\n";
                     }
                     if(btIgnoreOutliers){
                         btResult = 0.0;
@@ -850,26 +857,35 @@ exit &= entryDateTime[currentSymbolIndex] != DUMMY_INT && entryPriceThisMinute[c
                 entryDateTime[currentSymbolIndex] = DUMMY_INT;
             }
 
-            // check if all previous minutes have been recorded/filled
+            // check if all previous minutes have been recorded/filled (this could be changed depending on strategy)
             bool flag = 1;
             for(int i=0;i<maxNumMinutes;i++){
-                if(previousMinutesO[currentSymbolIndex][i] == DUMMY_DOUBLE || previousMinutesH[currentSymbolIndex][i] == DUMMY_DOUBLE || previousMinutesL[currentSymbolIndex][i] == DUMMY_DOUBLE || previousMinutesC[currentSymbolIndex][i] == DUMMY_DOUBLE || previousMinutesV[currentSymbolIndex][i] == DUMMY_DOUBLE){
+                if(open[currentSymbolIndex][i] == DUMMY_DOUBLE || high[currentSymbolIndex][i] == DUMMY_DOUBLE || low[currentSymbolIndex][i] == DUMMY_DOUBLE || close[currentSymbolIndex][i] == DUMMY_DOUBLE || volume[currentSymbolIndex][i] == DUMMY_DOUBLE){
                     flag = 0;
                     break;
                 }
             }
             if(flag){
 
+                double vpm = INFINITY;
+                if(minutesSinceOpen > 0) vpm = (double)totalVolume[currentSymbolIndex][currentDateIndex] / (double)minutesSinceOpen;
+                
                 // check entry condition (varies based on strategy)
-bool enter = (previousMinutesC[currentSymbolIndex][0] - previousMinutesO[currentSymbolIndex][5]) / previousMinutesO[currentSymbolIndex][5] >= 0.5 && currentTime >= 1000;
-                if(entryPriceThisMinute[currentSymbolIndex] == DUMMY_DOUBLE && enter){
-
-                    if(btPrintEntries){
-                        cout << "Entry: " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << currentTime << "\n";
-                    }
+bool enter = (close[currentSymbolIndex][0] - open[currentSymbolIndex][15]) / open[currentSymbolIndex][15] <= -0.05;
+enter &= vpm >= 5000.0; // volume filtering using vpm
+enter &= currentTime >= 1100 && currentTime <= 1600; // time of day filtering
+enter &= minutesSinceOpen >= 60; // ensure prev day's prices aren't recorded within past prices (i.e. close[])
+enter &= close[currentSymbolIndex][0] >= 1.0; // price filtering
+enter &= entryDateTime[currentSymbolIndex] == DUMMY_INT && entryPriceThisMinute[currentSymbolIndex] == DUMMY_DOUBLE;
+                if(enter){
 
                     // enter a trade at this minute if positive
                     if(currentOHLCV[3] > 0.0){
+
+                        if(btPrintEntries && !btPrintLoading){
+                            cout << "Entry: " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << currentTime << "\n";
+                        }
+
                         entryPriceThisMinute[currentSymbolIndex] = currentOHLCV[3];
                         entryDateTime[currentSymbolIndex] = currentDateTime;
                     }
@@ -891,7 +907,7 @@ bool enter = (previousMinutesC[currentSymbolIndex][0] - previousMinutesO[current
 }
 
 // read every file in the folder given by this address
-void readAllFiles(bool daywiseBacktesting, string path, int printLoadingEveryNFiles, bool printLoading) {
+void readAllFiles(bool daywiseBacktesting, string path) {
 
     checkColumnCodes();
 
@@ -913,6 +929,26 @@ void readAllFiles(bool daywiseBacktesting, string path, int printLoadingEveryNFi
 
     // read all files
     for (const auto& entry : fs::directory_iterator(path)){
+        // print the loading bar or number of files complete depending on settings
+        if(btPrintLoading){
+            cout << "[";
+            for(int i=1;i<=btLoadingBarWidth;i++){
+                double pct = (double)numFilesComplete / (double)numFiles;
+                if(pct >= (double)i / (double)btLoadingBarWidth){
+                    cout << "=";
+                }else{
+                    cout << " ";
+                }
+            }
+            double pct = (double)numFilesComplete / (double)numFiles;
+            cout << "] " << (int)(pct * 10000.0) / 100 << "." << (int)(pct * 10000.0) % 100 << "% (" << numFilesComplete << "/" << numFiles << ")\r";
+            cout.flush();
+        }else{
+            if(numFilesComplete % btPrintLoadingInterval == 0){
+                cout << numFilesComplete << "/" << numFiles << " files complete.\n";
+            }
+        }
+
         fileAddress = entry.path().string();
         if(readCustomFiles){
             for(int i=0;i<numFiles;i++){
@@ -925,12 +961,17 @@ void readAllFiles(bool daywiseBacktesting, string path, int printLoadingEveryNFi
             readFile(daywiseBacktesting);
         }
         numFilesComplete++;
-        if(numFilesComplete % printLoadingEveryNFiles == 0 && printLoading){
-            cout << numFilesComplete << "/" << numFiles << " files complete.\n";
-        }
     }
 
-    cout << "Finished reading " << numFilesComplete << "/" << numFiles << " files of " << numFilesTotal << " files in this folder.\n\n";
+    if(btPrintLoading){
+        cout << "[";
+        for(int i=1;i<=btLoadingBarWidth;i++){
+            cout << "=";
+        }
+        cout << "] 100.00% (" << numFiles << "/" << numFiles << ")\n";
+    }
+
+    cout << "Finished reading " << numFiles << " of " << numFilesTotal << " files in this folder.\n\n";
 }
 
 // setup the data storage
@@ -963,6 +1004,7 @@ void setup() {
         numBars[i] = 0;
         priceSweeper[i] = DUMMY_DOUBLE;
         lastDateTime[i] = DUMMY_INT;
+        earliestTimeDay[i] = DUMMY_INT;
 
         for (j = 0; j < maxNumDates; j++) {
             totalVolume[i][j] = 0;
@@ -977,11 +1019,11 @@ void setup() {
 
         for(j=0;j<maxNumMinutes;j++){
             
-            previousMinutesO[i][j] = DUMMY_DOUBLE;
-            previousMinutesH[i][j] = DUMMY_DOUBLE;
-            previousMinutesL[i][j] = DUMMY_DOUBLE;
-            previousMinutesC[i][j] = DUMMY_DOUBLE;
-            previousMinutesV[i][j] = DUMMY_DOUBLE;
+            open[i][j] = DUMMY_DOUBLE;
+            high[i][j] = DUMMY_DOUBLE;
+            low[i][j] = DUMMY_DOUBLE;
+            close[i][j] = DUMMY_DOUBLE;
+            volume[i][j] = DUMMY_DOUBLE;
         }
     }
 }
@@ -1255,19 +1297,19 @@ void analyzeDaywise() {
 
             // trade this symbol (in all experiments where the # stocks traded each day >= this stock's index on this day)
             btResult = exits[dateIndex][tradeSymbolIndexByDate];
-            if(btPrintAllResults && !btPrintDetailedResults){
+            if(btPrintAllResults && !btPrintDetailedResults && !btPrintLoading){
                 cout << btResult << " ";
             }
-            if(btPrintDetailedResults){
+            if(btPrintDetailedResults && !btPrintLoading){
                 cout << "Exit: " << exits[dateIndex][tradeSymbolIndexByDate] << "\nSymbol: " << tradeSymbol << "\nDate: " << index_date.at(dateIndex) << "\n";
             }
-            if(btPrintEntries){
+            if(btPrintEntries && !btPrintLoading){
                 cout << "Entry: " << entries[dateIndex][tradeSymbolIndexByDate] << "\n";
             }
             if(btResult <= btMinOutlier || btResult >= btMaxOutlier){
                 btNumOutliers++;
-                if(btPrintOutliers){
-                    cout << btResult << " " << tradeSymbol << " " << index_date.at(dateIndex) << "\n";
+                if(btPrintOutliers && !btPrintLoading){
+                    cout << "Outlier: " << btResult << " " << tradeSymbol << " " << index_date.at(dateIndex) << "\n";
                 }
                 if(btIgnoreOutliers){
                     btResult = 0.0;
@@ -1696,13 +1738,13 @@ void backtestDaywise(string readPath, int numVolumeDays, int minVolume, int maxV
     }
 
     // filesToRead = {"C:\\Minute Stock Data\\2025-05-12.csv"};
-    readAllFiles(true, readPath, 5, true);
+    readAllFiles(true, readPath);
     setupDateData(numVolumeDays, minVolume, maxVolume, includePartialDailyVolumeSamples);
     sortDateData(sortSymbolEntriesAscending);
     analyzeDaywise();
 }
 
-void backtestMinutewise(string readPath, int numVolumeDays, int minVolume, int maxVolume, bool includePartialDailyVolumeSamples){
+void backtestMinutewise(string readPath){
 
     btResult = 0.0;
     btNumOutliers = 0;
@@ -1716,7 +1758,7 @@ void backtestMinutewise(string readPath, int numVolumeDays, int minVolume, int m
     mwbtSD = 0.0;
 
     // filesToRead = {"C:\\Minute Stock Data\\2025-05-12.csv"};
-    readAllFiles(false, readPath, 5, true);
+    readAllFiles(false, readPath);
     analyzeMinutewise();
 }
 
@@ -1728,8 +1770,9 @@ int main() {
 
     // set backtesting settings:
     // int btStartingDateIndex, int btEndingDateIndex, int dwbtNumSymbolsPerDay, long long dwbtMinPreviousVolume, long long dwbtMaxPreviousVolume,
-    // int btPreviousVolumeLookBackLength, double btLeverage, bool btDisregardFilters, double btMinOutlier, double btMaxOutlier,
-    // bool btPrintOutliers, bool btIgnoreOutliers, bool btPrintEntries, bool btPrintAllResults, bool btPrintDetailedResults
+    // int btPreviousVolumeLookBackLength, double btLeverage, bool btDisregardFilters, double btMinOutlier, double btMaxOutlier, bool btIgnoreOutliers,
+    // bool btPrintOutliers, bool btPrintEntries, bool btPrintAllResults, bool btPrintDetailedResults,
+    // bool btPrintLoading, bool btPrintLoadingInterval
     btStartingDateIndex = 0;
     btEndingDateIndex = -1;
     dwbtNumSymbolsPerDay = 5;
@@ -1739,15 +1782,18 @@ int main() {
     btLeverage = 0.1;
     btDisregardFilters = true;
     btMinOutlier = -0.5;
-    btMaxOutlier = 0.5;
+    btMaxOutlier = 1.0;
+    btIgnoreOutliers = false;
     btPrintOutliers = true;
-    btIgnoreOutliers = true;
-    btPrintEntries = true;
+    btPrintEntries = false;
     btPrintAllResults = true;
     btPrintDetailedResults = true;
+    btPrintLoading = true;
+    btPrintLoadingInterval = 5;
+    btLoadingBarWidth = 60;
 
-    //backtestDaywise(readPath, 10, 1000000, INT_MAX, true, true);
-    backtestMinutewise(readPath, 10, 1000000, INT_MAX, true);
+    //backtestDaywise(readPath, 10, 0, INT_MAX, true, true);
+    backtestMinutewise(readPath);
 
     //vector<string> banned = { "" };
     //extractSymbolData("C:\\Stock Symbols\\symbolDataNASDAQ.txt", "symbol:", "volume:", "marketCap:", 1, 0, -6);
