@@ -27,3 +27,11 @@ You can also input data as a text file and extract filtered ticker symbols along
 The program has two modes: daywise and minutewise backtesting.
 Daywise enters and exits trades at specified times of the day (according to storedTimes and storedMetrics) on a predefined number of assets with the greatest change (by default, but this can be changed) between the first two storedTimes.
 Minutewise enters and exits trades based on specified entry and exit conditions at any time of day.
+
+Things to watch out for when backtesting:
+- If using a new dataset, test each function individually to make sure the full backtesting process works correctly.
+- This backtesting process can cause the following biases:
+- Minutewise: Trades that are entered but not exited (because that symbol's data ends before an exit signal is given) are not counted in the results. So if unexited trades are, on average, less profitable due to your strategy, the results will appear more profitable then they should.
+- Minutewise: You can be in several trades simultaneously, when in real life, this may not be the case. If many symbols' price movements are correlated, effects of correlated price movements may be overrepresented compared to trading one symbol at a time.
+- Minutewise: Entries and exits can only occur on bars that are actually in the dataset. Symbols with lots of dataset holes may be underrepresented compared to a real strategy that enters and exits at any time.
+- Daywise: Symbols that start after the first storedTime (only on first day) or end before the final storedTime (only on last day) are not traded and may be underrepresented compared to a real strategy that enters and exits at any time.
