@@ -41,7 +41,7 @@ string columnCodes = "";
 bool daywiseBacktesting = 0;
 
 #define maxNumSymbols 20000 // with about 12 arrays of size maxNumSymbols * maxNumDates, this product can be at most ~10000000 (resulting in 960M bytes)
-#define maxNumDates 200
+#define maxNumDates 400
 #define numStoredTimes 3
 
 // maximum number of previous minutes being recorded (only need as much as strategy requires)
@@ -53,11 +53,15 @@ double low[maxNumSymbols][maxNumMinutes];
 double close[maxNumSymbols][maxNumMinutes];
 double volume[maxNumSymbols][maxNumMinutes];
 
-#define mwbtNumStrategies 15
+// number of possible values for the first and second variable when minutewise backtesting
+#define mwbtNumTrialsFirst 25
+#define mwbtNumTrialsSecond 10
+
+const int mwbtNumTrialsTotal = mwbtNumTrialsFirst * mwbtNumTrialsSecond;
 
 // trade entry price and time for each strategy, dummy when not in trade
-double entryPrices[maxNumSymbols][mwbtNumStrategies];
-long long entryDateTime[maxNumSymbols][mwbtNumStrategies];
+double entryPrices[maxNumSymbols][mwbtNumTrialsTotal];
+long long entryDateTime[maxNumSymbols][mwbtNumTrialsTotal];
 
 // file parsing info
 long long numBarsTotal = 0;
@@ -189,6 +193,8 @@ vector<double> mwbtBalance;
 vector<double> mwbtVar;
 vector<double> mwbtSD;
 vector<int> mwbtNumOutliers;
+
+string aggregateBacktestingResults = "";
 
 
 long long power(int b, int e) {
@@ -884,21 +890,23 @@ void readLine(int numValuesPerLine){
     ma[currentSymbolIndex][currentDateIndex] = 0.0;
     //for(int i=0;i<)
 
-    // exit trades in all strategies
-    for(int strat = 0; strat < mwbtNumStrategies; strat++){
+    // exit trades in all strategy trials
+    for(int firstTrial = 0; firstTrial < mwbtNumTrialsFirst; firstTrial++){
+    for(int secondTrial = 0; secondTrial < mwbtNumTrialsSecond; secondTrial++){
+    int trial = firstTrial * mwbtNumTrialsSecond + secondTrial;
 
-    int minutesSinceEntry = (currentDateTime % 100) - (entryDateTime[currentSymbolIndex][strat] % 100) + ((currentDateTime / 100) - (entryDateTime[currentSymbolIndex][strat] / 100)) * 60;
+    int minutesSinceEntry = (currentDateTime % 100) - (entryDateTime[currentSymbolIndex][trial] % 100) + ((currentDateTime / 100) - (entryDateTime[currentSymbolIndex][trial] / 100)) * 60;
 
     // exit condition logic
 //bool exit = minutesSinceEntry >= 30;
-bool exit = currentTime >= 1530;
+bool exit = currentTime >= 1550;
 
     // exit a trade at this minute if currently in a trade and exit condition succeeds (varies based on strategy)
     // NOTE: we can only exit on a listed bar. so if exits are time-based rather than price-based, they may be unideal and even biased
-exit &= entryDateTime[currentSymbolIndex][strat] != DUMMY_INT && entryPrices[currentSymbolIndex][strat] != DUMMY_DOUBLE;
+exit &= entryDateTime[currentSymbolIndex][trial] != DUMMY_INT && entryPrices[currentSymbolIndex][trial] != DUMMY_DOUBLE;
     if(exit){
 
-        double entryPrice = entryPrices[currentSymbolIndex][strat];
+        double entryPrice = entryPrices[currentSymbolIndex][trial];
         double exitPrice = currentOHLCV[3];
 
         btResult = (exitPrice - entryPrice) / entryPrice;
@@ -906,37 +914,37 @@ exit &= entryDateTime[currentSymbolIndex][strat] != DUMMY_INT && entryPrices[cur
             cout << btResult << " ";
         }
         if(btPrintDetailedResults && !btPrintLoading){
-            cout << "Exit: " << exitPrice << " " << btResult << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << entryDateTime[currentSymbolIndex][strat] % 10000 << "-" << currentTime << "\n";
+            cout << "Exit " << firstTrial << " " << secondTrial << ": " << exitPrice << " " << btResult << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << entryDateTime[currentSymbolIndex][trial] % 10000 << "-" << currentTime << "\n";
         }
         if(btResult <= btMinOutlier || btResult >= btMaxOutlier){
-            mwbtNumOutliers[strat]++;
+            mwbtNumOutliers[trial]++;
             if(btPrintOutliers && !btPrintLoading){
-                cout << "Outlier: " << btResult << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << currentTime << "\n";
+                cout << "Outlier " << firstTrial << " " << secondTrial << ": " << btResult << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << currentTime << "\n";
             }
             if(btIgnoreOutliers){
                 btResult = 0.0;
             }
         }
         if (btResult > 0.0) {
-            mwbtWins[strat]++;
-            mwbtWon[strat] += btResult;
+            mwbtWins[trial]++;
+            mwbtWon[trial] += btResult;
         }
         else {
             if (btResult < 0.0) {
-                mwbtLosses[strat]++;
-                mwbtLost[strat] += btResult;
+                mwbtLosses[trial]++;
+                mwbtLost[trial] += btResult;
             }
             else {
-                mwbtTies[strat]++;
+                mwbtTies[trial]++;
             }
         }
 
         // update account balance stats
-        mwbtVar[strat] += btResult * btResult;
-        mwbtBalance[strat] *= (1.0 + btResult);
+        mwbtVar[trial] += btResult * btResult;
+        mwbtBalance[trial] *= (1.0 + btResult);
 
-        entryPrices[currentSymbolIndex][strat] = DUMMY_DOUBLE;
-        entryDateTime[currentSymbolIndex][strat] = DUMMY_INT;
+        entryPrices[currentSymbolIndex][trial] = DUMMY_DOUBLE;
+        entryDateTime[currentSymbolIndex][trial] = DUMMY_INT;
     }
 
     if(fullyFilled){
@@ -946,32 +954,33 @@ exit &= entryDateTime[currentSymbolIndex][strat] != DUMMY_INT && entryPrices[cur
         
         // entry condition logic
 //bool enter = ((close[currentSymbolIndex][0] - open[currentSymbolIndex][30]) / open[currentSymbolIndex][30]) <= -0.05;
-bool enter = dailyGapPortion[currentSymbolIndex][currentDateIndex] != DUMMY_DOUBLE && dailyGapPortion[currentSymbolIndex][currentDateIndex] <= -0.1;
+bool enter = dailyGapPortion[currentSymbolIndex][currentDateIndex] != DUMMY_DOUBLE && dailyGapPortion[currentSymbolIndex][currentDateIndex] <= (double)secondTrial * -0.02;
 //enter &= dailyChangePortion[currentSymbolIndex][currentDateIndex] != DUMMY_DOUBLE && dailyChangePortion[currentSymbolIndex][currentDateIndex] < -0.04;
 //bool enter = 1;
 //bool enter = currentTime == 1100;
 //bool enter = low[currentSymbolIndex][0] == dailyLow[currentSymbolIndex][currentDateIndex] && currentTime != dailyLowTime[currentSymbolIndex][currentDateIndex];
 if(currentDateIndex > 0){
-    enter &= totalVolume[currentSymbolIndex][currentDateIndex - 1] >= strat * 100000 && totalVolume[currentSymbolIndex][currentDateIndex - 1] <= (strat+1) * 100000; // volume filtering using previous day's volume
+    enter &= totalVolume[currentSymbolIndex][currentDateIndex - 1] >= firstTrial * 200000; // volume filtering using previous day's volume
 }else{enter = 0;}
 //enter &= vpm >= 5000.0; // volume filtering using vpm
 enter &= currentTime >= 930 && currentTime <= 935; // time of day filtering
 //enter &= minutesSinceFirstBar >= 30; // ensure prev day's prices aren't recorded within past prices (i.e. close[])
 enter &= close[currentSymbolIndex][0] >= 1.0; // price filtering
-enter &= entryDateTime[currentSymbolIndex][strat] == DUMMY_INT && entryPrices[currentSymbolIndex][strat] == DUMMY_DOUBLE;
+enter &= entryDateTime[currentSymbolIndex][trial] == DUMMY_INT && entryPrices[currentSymbolIndex][trial] == DUMMY_DOUBLE;
 // enter &= currentDateIndex >= btStartingDateIndex && currentDateIndex <= btEndingDateIndex; can't check date indices bc dk how many dates there are while reading
         if(enter){
 
             // enter a trade at this minute if positive
             if(btPrintEntries && !btPrintLoading){
-                cout << "Entry: " << currentOHLCV[3] << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << currentTime << "\n";
+                cout << "Entry " << firstTrial << " " << secondTrial << ": " << currentOHLCV[3] << " " << currentSymbol << " " << index_date.at(currentDateIndex) << " " << currentTime << "\n";
             }
 
-            entryPrices[currentSymbolIndex][strat] = currentOHLCV[3];
-            entryDateTime[currentSymbolIndex][strat] = currentDateTime;
+            entryPrices[currentSymbolIndex][trial] = currentOHLCV[3];
+            entryDateTime[currentSymbolIndex][trial] = currentDateTime;
         }
     }
 
+    }
     }
 
     // update the price sweeper for this symbol with the last close recorded
@@ -1136,7 +1145,7 @@ void setup() {
         userVolumes[i] = DUMMY_INT;
         userMarketCaps[i] = DUMMY_INT;
 
-        for (j = 0; j < mwbtNumStrategies; j++) {
+        for (j = 0; j < mwbtNumTrialsTotal; j++) {
             entryPrices[i][j] = DUMMY_DOUBLE;
             entryDateTime[i][j] = DUMMY_INT;
         }
@@ -1544,9 +1553,9 @@ void analyzeMinutewise() {
 
     output += "Backtested minutewise over " + to_string(numDates) + " days.\n\n";
 
-    for(int i=0;i<mwbtNumStrategies;i++){
+    for(int i=0;i<mwbtNumTrialsTotal;i++){
     
-        output += "ANALYSIS " + to_string(i+1) + ":\n\n";
+        output += "ANALYSIS " + to_string(i / mwbtNumTrialsSecond) + " " + to_string(i % mwbtNumTrialsSecond) + ":\n\n";
         output += "Trades/Wins/Losses/Ties: " + to_string(mwbtWins[i] + mwbtLosses[i] + mwbtTies[i]) + "/" + to_string(mwbtWins[i]) + "/" + to_string(mwbtLosses[i]) + "/" + to_string(mwbtTies[i]);
 
         output += "\nPercentage Won/Lost/Net: " + to_string(mwbtWon[i] * 100.0) + "/" + to_string(mwbtLost[i] * 100.0) + "/" + to_string((mwbtWon[i] + mwbtLost[i]) * 100.0);
@@ -1571,6 +1580,7 @@ void analyzeMinutewise() {
         output += "\nThere were " + to_string(mwbtNumOutliers[i]) + " outlying trade results.\n\n";
     }
 
+    aggregateBacktestingResults += output;
     cout << output;
 }
 
@@ -1917,7 +1927,7 @@ void backtestDaywise(string readPath, int numVolumeDays, int minVolume, int maxV
 void backtestMinutewise(string readPath){
 
     btResult = 0.0;
-    for(int i=0;i<mwbtNumStrategies;i++){
+    for(int i=0;i<mwbtNumTrialsTotal;i++){
         mwbtWins.push_back(0);
         mwbtLosses.push_back(0);
         mwbtTies.push_back(0);
@@ -1966,6 +1976,15 @@ int main() {
 
     //backtestDaywise(readPath, 10, 0, INT_MAX, true, true);
     backtestMinutewise(readPath);
+
+    ofstream f("C:\\Notes\\trade\\Current Aggregate Backtesting Results.txt");
+
+    if (!f.is_open()) {
+        cerr << "File " << fileAddress << " was found but could not be opened.\n\n";
+        exit(1);
+    }
+    f << aggregateBacktestingResults;
+    f.close();
 
     //vector<string> banned = { "" };
     //extractSymbolData("C:\\Stock Symbols\\symbolDataNASDAQ.txt", "symbol:", "volume:", "marketCap:", 1, 0, -6);
