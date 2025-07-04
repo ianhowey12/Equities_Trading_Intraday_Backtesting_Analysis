@@ -52,11 +52,12 @@ double low[maxNumSymbols][numMinutesPerDay];
 double close[maxNumSymbols][numMinutesPerDay];
 double volume[maxNumSymbols][numMinutesPerDay];
 
-// number of possible values for the first and second variable when minutewise backtesting
-#define mwbtNumTrialsFirst 10
-#define mwbtNumTrialsSecond 10
+// number of possible values for the variables when minutewise backtesting
+#define mwbtNumTrialsFirst 4
+#define mwbtNumTrialsSecond 4
+#define mwbtNumTrialsThird 5
 
-const int mwbtNumTrialsTotal = mwbtNumTrialsFirst * mwbtNumTrialsSecond;
+const int mwbtNumTrialsTotal = mwbtNumTrialsFirst * mwbtNumTrialsSecond * mwbtNumTrialsThird;
 
 // trade entry price and time for each strategy, dummy when not in trade
 double entryPrices[maxNumSymbols][mwbtNumTrialsTotal];
@@ -122,11 +123,6 @@ double dailyGap[maxNumSymbols][maxNumDates];
 double dailyChangePortion[maxNumSymbols][maxNumDates];
 double dailyGapPortion[maxNumSymbols][maxNumDates];
 
-// previous candle nums and sums of changes
-#define maxBarSamplingLength 30
-int numUp[maxNumSymbols][maxBarSamplingLength];
-int numDown[maxNumSymbols][maxBarSamplingLength];
-
 // cumulative volume for each symbol and date (used in both daywise and minutewise backtesting)
 long long totalVolume[maxNumSymbols][maxNumDates];
 
@@ -145,6 +141,17 @@ int numAllowedTickers = 0;
 unordered_map<string, int> allowed_index;
 unordered_map<int, string> index_allowed;
 
+// basic minutewise measurements
+double cumulativeVolume[numMinutesPerDay];
+long long tv = 0;
+double change[numMinutesPerDay];
+int numGreen[numMinutesPerDay];
+int numRed[numMinutesPerDay];
+int numUp[numMinutesPerDay];
+int numDown[numMinutesPerDay];
+int ng = 0, nr = 0, nu = 0, nd = 0;
+
+vector<int> tradingTimes = {0, numMinutesPerDay - 1};
 
 // global backtesting settings
 int btStartingDateIndex = 0;
@@ -584,8 +591,8 @@ int index_time(int i){
 
 // convert time to minutes past 930
 int time_index(int t){
-    if(t < 930 || t > 1929){
-        cerr << "Time must be between 930 and 1929. It is " << t << ".\n";
+    if(t < 930 || t > 2359){
+        cerr << "Time must be between 930 and 2359. It is " << t << ".\n";
         exit(1);
     }
     if(t % 100 > 59){
@@ -595,95 +602,9 @@ int time_index(int t){
     return ((t % 100) - 30) + ((t / 100) - 9) * 60;
 }
 
-// exit and enter at specified times during the day currently recorded in ohlcv arrays
-void simulateTradesMinutewise(int s, int d){
-        
-    // fill in holes
-    for(int t=1;t<numMinutesPerDay;t++){
-        if(close[s][t] == DUMMY_DOUBLE){
-            open[s][t] = close[s][t-1];
-            high[s][t] = close[s][t-1];
-            low[s][t] = close[s][t-1];
-            close[s][t] = close[s][t-1];
-            volume[s][t] = 0;
-        }
-    }
-
+void simulateMinute(int s, int d, int t, int firstTrial, int secondTrial, int thirdTrial, int trial){
     string symbol = index_symbol.at(s);
-
-    // update dailies for fully filled day
-    
-    dailyOpen[s][d] = open[s][0];
-    dailyClose[s][d] = close[s][numMinutesPerDay - 1];
-
-    dailyHigh[s][d] = -1.0 * 1e20;
-    dailyLow[s][d] = 1.0 * 1e20;
-    for(int t=0;t<numMinutesPerDay;t++){
-        if(high[s][t] > dailyHigh[s][d]){
-            dailyHigh[s][d] = high[s][t];
-            dailyHighTime[s][d] = currentTime;
-        }
-        if(low[s][t] < dailyLow[s][d]){
-            dailyLow[s][d] = low[s][t];
-            dailyLowTime[s][d] = currentTime;
-        }
-    }
-    
-    dailyChange[s][d] = dailyClose[s][d] - dailyOpen[s][d];
-    if(dailyOpen[s][d] == 0.0){ // avoid / by 0
-        dailyChangePortion[s][d] = 0.0;
-    }else{
-        dailyChangePortion[s][d] = dailyChange[s][d] / dailyOpen[s][d];
-    }
-    if(d > 0){
-        if(dailyGap[s][d] == DUMMY_DOUBLE && dailyClose[s][d - 1] != DUMMY_DOUBLE){
-            // if previous day exists and had a recorded close, current minute is within hours, and gap hasn't been recorded, record gap
-            dailyGap[s][d] = dailyOpen[s][d] - dailyClose[s][d - 1];
-            if(dailyClose[s][d - 1] == 0.0){ // avoid / by 0
-                dailyGapPortion[s][d] = 0.0;
-            }else{
-                dailyGapPortion[s][d] = dailyGap[s][d] / dailyClose[s][d - 1];
-            }
-        }
-    }
-    dailyRange[s][d] = dailyHigh[s][d] - dailyLow[s][d];
-    if(dailyRange[s][d] == 0.0){ // avoid / by 0
-        currentDailyRangeIndex[s] = 0.5;
-    }else{
-        currentDailyRangeIndex[s] = (close[s][0] - dailyLow[s][d]) / dailyRange[s][d];
-    }
-    
-    // BASIC MEASUREMENTS
-
-    double cumulativeVolume[numMinutesPerDay];
-    long long tv = 0;
-    for(int m=0;m<numMinutesPerDay;m++){
-        tv += volume[s][m];
-        cumulativeVolume[m] = tv;
-    }
-
-    double change[numMinutesPerDay];
-    for(int m=0;m<numMinutesPerDay;m++){
-        if(open[s][0] == 0.0){
-            change[m] = 0.0;
-        }else{
-            change[m] = (close[s][m] - open[s][0]) / open[s][0];
-        }
-    }
-
-    // update the previous counts and sums
-
-    // update the moving averages
-    ma[currentSymbolIndex][currentDateIndex] = 0.0;
-    //for(int i=0;i<)
-
-
-    // execute all exits and entries on all trials for this symbol today
-    for(int t = time_index(mwbtEarliestTimeToTrade); t <= time_index(mwbtLatestTimeToTrade); t++){
-        int T = index_time(t);
-    for(int firstTrial = 0; firstTrial < mwbtNumTrialsFirst; firstTrial++){
-    for(int secondTrial = 0; secondTrial < mwbtNumTrialsSecond; secondTrial++){
-    int trial = firstTrial * mwbtNumTrialsSecond + secondTrial;
+    int T = index_time(t);
 
     int minutesSinceEntry = -1;
     if(entryMinutesSinceOpen[s][trial] != DUMMY_INT){
@@ -692,7 +613,7 @@ void simulateTradesMinutewise(int s, int d){
 
     // exit condition logic
 //bool exit = minutesSinceEntry >= 30;
-bool exit = T >= 1005;
+bool exit = T == 1559;
 
     // exit a trade at this minute if currently in a trade and exit condition succeeds (varies based on strategy)
     // NOTE: we can only exit on a listed bar. so if exits are time-based rather than price-based, they may be unideal and even biased
@@ -707,12 +628,12 @@ exit &= entryMinutesSinceOpen[s][trial] != DUMMY_INT && entryPrices[s][trial] !=
             cout << btResult << " ";
         }
         if(btPrintDetailedResults && !btPrintLoading){
-            cout << "Exit " << firstTrial << " " << secondTrial << ": " << exitPrice << " " << btResult << " " << symbol << " " << index_date.at(d) << " " << index_time(entryMinutesSinceOpen[s][trial]) << "-" << index_time(t) << "\n";
+            cout << "Exit " << firstTrial << " " << secondTrial << " " << thirdTrial << ": " << exitPrice << " " << btResult << " " << symbol << " " << index_date.at(d) << " " << index_time(entryMinutesSinceOpen[s][trial]) << "-" << index_time(t) << "\n";
         }
         if(btResult <= btMinOutlier || btResult >= btMaxOutlier){
             mwbtNumOutliers[trial]++;
             if(btPrintOutliers && !btPrintLoading){
-                cout << "Outlier " << firstTrial << " " << secondTrial << ": " << btResult << " " << symbol << " " << index_date.at(d) << " " << index_time(entryMinutesSinceOpen[s][trial]) << "\n";
+                cout << "Outlier " << firstTrial << " " << secondTrial << " " << thirdTrial << ": " << btResult << " " << symbol << " " << index_date.at(d) << " " << index_time(entryMinutesSinceOpen[s][trial]) << "\n";
             }
             if(btIgnoreOutliers){
                 btResult = 0.0;
@@ -739,18 +660,19 @@ exit &= entryMinutesSinceOpen[s][trial] != DUMMY_INT && entryPrices[s][trial] !=
         entryPrices[s][trial] = DUMMY_DOUBLE;
         entryMinutesSinceOpen[s][trial] = DUMMY_INT;
     }
-        
+    
     // entry condition logic
-//bool enter = dailyGapPortion[s][d] != DUMMY_DOUBLE && dailyGapPortion[s][d] <= -0.06 - ((double)secondTrial * 0.02);
-bool enter = change[t] != DUMMY_DOUBLE && change[t] <= -0.0 - ((double)secondTrial * 0.02);
+//bool enter = numGreen[t] == t + 1;
+bool enter = dailyGapPortion[s][d] != DUMMY_DOUBLE && dailyGapPortion[s][d] >= 0.0 + ((double)secondTrial * 0.02);
 if(d > 0){
-    enter &= totalVolume[s][d - 1] >= firstTrial * 2000000; // volume filtering using previous day's volume
+    enter &= totalVolume[s][d - 1] >= firstTrial * 2000000 + 10000000; // volume filtering using previous day's volume
 }else{enter = 0;}
+enter &= change[t] != DUMMY_DOUBLE && change[t] >= 0.0 + ((double)thirdTrial * 0.02);
 //if(d > 0){
-//    enter &= totalVolume[s][d - 1] * close[s][t] >= firstTrial * 2000000; // volume filtering using previous day's turnover
+//    enter &= totalVolume[s][d - 1] * (long long)close[s][t] >= (long long)firstTrial * 20000000ll + 100000000ll; // volume filtering using previous day's turnover
 //}else{enter = 0;}
 //enter &= cumulativeVolume[t] / (double)(t + 1) >= 5000.0; // volume filtering using vpm
-enter &= T < 1005; // time of day filtering
+enter &= T == 930; // time of day filtering
 enter &= close[s][t] >= 1.0; // price filtering
 enter &= entryMinutesSinceOpen[s][trial] == DUMMY_INT && entryPrices[s][trial] == DUMMY_DOUBLE;
 // enter &= d >= btStartingDateIndex && d <= btEndingDateIndex; can't check date indices bc dk how many dates there are while reading
@@ -760,11 +682,114 @@ enter &= entryMinutesSinceOpen[s][trial] == DUMMY_INT && entryPrices[s][trial] =
         entryMinutesSinceOpen[s][trial] = t;
 
         if(btPrintEntries && !btPrintLoading){
-            cout << "Entry " << firstTrial << " " << secondTrial << ": " << entryPrices[s][trial] << " " << symbol << " " << index_date.at(d) << " " << index_time(entryMinutesSinceOpen[s][trial]) << "\n";
+            cout << "Entry " << firstTrial << " " << secondTrial << " " << thirdTrial << ": " << entryPrices[s][trial] << " " << symbol << " " << index_date.at(d) << " " << index_time(entryMinutesSinceOpen[s][trial]) << "\n";
+        }
+    }
+}
+
+// exit and enter at specified times during the day currently recorded in ohlcv arrays
+void simulateTradesMinutewise(int s, int d){
+        
+    // fill in holes
+    for(int t=1;t<numMinutesPerDay;t++){
+        if(close[s][t] == DUMMY_DOUBLE){
+            open[s][t] = close[s][t-1];
+            high[s][t] = close[s][t-1];
+            low[s][t] = close[s][t-1];
+            close[s][t] = close[s][t-1];
+            volume[s][t] = 0;
         }
     }
 
-    }}}
+    // update dailies for fully filled day
+    
+    dailyOpen[s][d] = open[s][0];
+    dailyClose[s][d] = close[s][numMinutesPerDay - 1];
+
+    dailyHigh[s][d] = -1.0 * 1e20;
+    dailyLow[s][d] = 1.0 * 1e20;
+    for(int t=0;t<numMinutesPerDay;t++){
+        if(high[s][t] > dailyHigh[s][d]){
+            dailyHigh[s][d] = high[s][t];
+            dailyHighTime[s][d] = currentTime;
+        }
+        if(low[s][t] < dailyLow[s][d]){
+            dailyLow[s][d] = low[s][t];
+            dailyLowTime[s][d] = currentTime;
+        }
+    }
+    
+    dailyChange[s][d] = dailyClose[s][d] - dailyOpen[s][d];
+    if(dailyOpen[s][d] == 0.0){ // avoid / by 0
+        dailyChangePortion[s][d] = 0.0;
+    }else{
+        dailyChangePortion[s][d] = dailyChange[s][d] / dailyOpen[s][d];
+    }
+    if(d > 0){
+        if(dailyClose[s][d - 1] != DUMMY_DOUBLE){
+            // if previous day exists and had a recorded close, record gap
+            dailyGap[s][d] = dailyOpen[s][d] - dailyClose[s][d - 1];
+            if(dailyClose[s][d - 1] == 0.0){ // avoid / by 0
+                dailyGapPortion[s][d] = 0.0;
+            }else{
+                dailyGapPortion[s][d] = dailyGap[s][d] / dailyClose[s][d - 1];
+            }
+        }
+    }
+    dailyRange[s][d] = dailyHigh[s][d] - dailyLow[s][d];
+    if(dailyRange[s][d] == 0.0){ // avoid / by 0
+        currentDailyRangeIndex[s] = 0.5;
+    }else{
+        currentDailyRangeIndex[s] = (dailyClose[s][d] - dailyLow[s][d]) / dailyRange[s][d];
+    }
+    
+    // BASIC MEASUREMENTS
+
+    ng = 0; nr = 0; nu = 0; nd = 0;
+    for(int m=0;m<numMinutesPerDay;m++){
+        tv += volume[s][m];
+        cumulativeVolume[m] = tv;
+        if(open[s][0] == 0.0){
+            change[m] = 0.0;
+        }else{
+            change[m] = (close[s][m] - open[s][0]) / open[s][0];
+        }
+        if(close[s][m] > open[s][m]){
+            ng++;
+        }
+        if(close[s][m] < open[s][m]){
+            nr++;
+        }
+        if(m > 0){
+            if(close[s][m] > close[s][m - 1]){
+                nu++;
+            }
+            if(close[s][m] < close[s][m - 1]){
+                nd++;
+            }
+        }
+        numGreen[m] = ng;
+        numRed[m] = nr;
+        numUp[m] = nu;
+        numDown[m] = nd;
+    }
+
+    // update the moving averages
+    ma[currentSymbolIndex][currentDateIndex] = 0.0;
+    //for(int i=0;i<)
+
+    
+    // execute all exits and entries on all trials for this symbol today
+    //for(int t = time_index(mwbtEarliestTimeToTrade); t <= time_index(mwbtLatestTimeToTrade); t++){
+    for(int t: tradingTimes){
+    for(int firstTrial = 0; firstTrial < mwbtNumTrialsFirst; firstTrial++){
+    for(int secondTrial = 0; secondTrial < mwbtNumTrialsSecond; secondTrial++){
+    for(int thirdTrial = 0; thirdTrial < mwbtNumTrialsThird; thirdTrial++){
+
+        int trial = firstTrial * mwbtNumTrialsSecond * mwbtNumTrialsThird + secondTrial * mwbtNumTrialsThird + thirdTrial;
+        simulateMinute(s, d, t, firstTrial, secondTrial, thirdTrial, trial);
+
+    }}}}
     
     // clear
     for(int t=0;t<numMinutesPerDay;t++){
@@ -1026,8 +1051,8 @@ void readLine(int numValuesPerLine){
 
     // update the earliest recorded time today
     int minutesSinceOpen = -1;
-    if(currentTime >= 930 && currentTime <= 1929) minutesSinceOpen = time_index(currentTime);
-    if(currentTime >= 1930) minutesSinceOpen = INT_MAX;
+    if(currentTime >= 930 && currentTime <= 2359) minutesSinceOpen = time_index(currentTime);
+    if(currentTime > 2359) minutesSinceOpen = INT_MAX;
     if(earliestTimeDay[currentSymbolIndex][currentDateIndex] == DUMMY_INT){
         // first time today
         earliestTimeDay[currentSymbolIndex][currentDateIndex] = currentTime;
@@ -1589,7 +1614,7 @@ void analyzeDaywise() {
 
     output += "Backtested daywise from date with index " + to_string(btStartingDateIndex) + " to index " + to_string(btEndingDateIndex) + ", " + to_string(btEndingDateIndex - btStartingDateIndex + 1) + " days.\n\n";
     
-    output += "ANALYSIS:\n\nTrades: ";
+    output += "SUMMARY:\n\nTrades: ";
     for(int j=0;j<dwbtNumSymbolsPerDay;j++){
         output += to_string(dwbtWins[j] + dwbtLosses[j] + dwbtTies[j]) + " ";
     }
@@ -1636,7 +1661,7 @@ void analyzeDaywise() {
 
     output += "\nVariance of Trade Results From Zero: ";
     for(int j=0;j<dwbtNumSymbolsPerDay;j++){
-        dwbtVar[j] /= (double)(dwbtWins[j] + dwbtLosses[j]);
+        dwbtVar[j] /= (double)(dwbtWins[j] + dwbtLosses[j] + dwbtTies[j]);
         output += to_string(dwbtVar[j]) + " ";
     }
 
@@ -1670,27 +1695,27 @@ void analyzeMinutewise() {
 
     for(int i=0;i<mwbtNumTrialsTotal;i++){
     
-        output += "ANALYSIS " + to_string(i / mwbtNumTrialsSecond) + " " + to_string(i % mwbtNumTrialsSecond) + ":\n\n";
+        output += "SUMMARY " + to_string(i / (mwbtNumTrialsSecond * mwbtNumTrialsThird)) + " " + to_string((i / mwbtNumTrialsThird) % mwbtNumTrialsSecond) + " " + to_string(i % mwbtNumTrialsThird) + ":\n\n";
         output += "Trades/Wins/Losses/Ties: " + to_string(mwbtWins[i] + mwbtLosses[i] + mwbtTies[i]) + "/" + to_string(mwbtWins[i]) + "/" + to_string(mwbtLosses[i]) + "/" + to_string(mwbtTies[i]);
 
         output += "\nPercentage Won/Lost/Net: " + to_string(mwbtWon[i] * 100.0) + "/" + to_string(mwbtLost[i] * 100.0) + "/" + to_string((mwbtWon[i] + mwbtLost[i]) * 100.0);
 
         output += "\nProfit Factor: ";
-        output += to_string(-1.0 * mwbtWon[i] / mwbtLost[i]) + "   ";
+        output += to_string(-1.0 * mwbtWon[i] / mwbtLost[i]);
 
         output += "\nFinal Balance: ";
-        output += to_string(mwbtBalance[i]) + "   ";
+        output += to_string(mwbtBalance[i]);
 
         output += "\nVariance of Trade Results From Zero: ";
-        mwbtVar[i] /= (double)(mwbtWins[i] + mwbtLosses[i]);
-        output += to_string(mwbtVar[i]) + "   ";
+        mwbtVar[i] /= (double)(mwbtWins[i] + mwbtLosses[i] + mwbtTies[i]);
+        output += to_string(mwbtVar[i]);
 
         output += "\nStandard Deviation of Trade Results From Zero: ";
         mwbtSD[i] = sqrt(mwbtVar[i]);
-        output += to_string(mwbtSD[i]) + "   ";
+        output += to_string(mwbtSD[i]);
 
         output += "\nSharpe Ratio: ";
-        output += to_string((mwbtWon[i] + mwbtLost[i]) / mwbtSD[i]) + "   ";
+        output += to_string((mwbtWon[i] + mwbtLost[i]) / mwbtSD[i]);
 
         output += "\nThere were " + to_string(mwbtNumOutliers[i]) + " outlying trade results.\n\n";
     }
@@ -2044,19 +2069,19 @@ void backtestDaywise(string readPath, int numVolumeDays, int minVolume, int maxV
 void backtestMinutewise(string readPath){
 
     if(mwbtEarliestTimeToTrade < 930 || mwbtEarliestTimeToTrade > 1559){
-        cerr << "mwbtEarliestTimeToTrade must be between 930 and 1559. It is " << mwbtEarliestTimeToTrade << " .\n\n";
+        cerr << "mwbtEarliestTimeToTrade must be between 930 and 1559. It is " << mwbtEarliestTimeToTrade << ".\n\n";
         exit(1);
     }
     if(mwbtEarliestTimeToTrade % 100 > 59){
-        cerr << "The minute of mwbtEarliestTimeToTrade must be between 0 and 59. It is " << mwbtEarliestTimeToTrade % 100 << " .\n\n";
+        cerr << "The minute of mwbtEarliestTimeToTrade must be between 0 and 59. It is " << mwbtEarliestTimeToTrade % 100 << ".\n\n";
         exit(1);
     }
     if(mwbtLatestTimeToTrade < 930 || mwbtLatestTimeToTrade > 1559){
-        cerr << "mwbtLatestTimeToTrade must be between 930 and 1559. It is " << mwbtLatestTimeToTrade << " .\n\n";
+        cerr << "mwbtLatestTimeToTrade must be between 930 and 1559. It is " << mwbtLatestTimeToTrade << ".\n\n";
         exit(1);
     }
     if(mwbtLatestTimeToTrade % 100 > 59){
-        cerr << "The minute of mwbtLatestTimeToTrade must be between 0 and 59. It is " << mwbtLatestTimeToTrade % 100 << " .\n\n";
+        cerr << "The minute of mwbtLatestTimeToTrade must be between 0 and 59. It is " << mwbtLatestTimeToTrade % 100 << ".\n\n";
         exit(1);
     }
 
@@ -2106,8 +2131,8 @@ int main() {
     dwbtMinPreviousVolume = 0;
     dwbtMaxPreviousVolume = INT_MAX;
     btPreviousVolumeLookBackLength = 1;
-    mwbtEarliestTimeToTrade = 1000;
-    mwbtLatestTimeToTrade = 1010;
+    mwbtEarliestTimeToTrade = 930;
+    mwbtLatestTimeToTrade = 1559;
     btLeverage = 1.0;
     btDisregardFilters = true;
     btMinOutlier = -0.5;
